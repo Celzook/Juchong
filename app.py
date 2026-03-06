@@ -333,36 +333,36 @@ def search_dart_api(company_name: str, api_key: str) -> tuple[str | None, str]:
         items = data.get("list", [])
 
         # 1순위: 소집결의 (정정 포함)
-    for item in items:
-        report_nm = item.get("report_nm", "")
-        if "주주총회소집결의" in report_nm or "[기재정정]주주총회소집결의" in report_nm:
-            rcept_no = item["rcept_no"]
-            report_nm_full = report_nm
-            rcept_dt = item.get("rcept_dt", "")  # 참고용
-            break
-
-    # 2순위: 소집공고
-    if not rcept_no:
         for item in items:
             report_nm = item.get("report_nm", "")
-            if "주주총회소집공고" in report_nm:
+            if "주주총회소집결의" in report_nm or "[기재정정]주주총회소집결의" in report_nm:
                 rcept_no = item["rcept_no"]
                 report_nm_full = report_nm
-                rcept_dt = item.get("rcept_dt", "")
+                rcept_dt = item.get("rcept_dt", "")  # 참고용
                 break
 
-    # 3순위: 주주총회 관련 모든 공시
-    if not rcept_no:
-        for item in items:
-            nm = item.get("report_nm", "")
-            if any(kw in nm for kw in ["주주총회", "정기총회", "소집결의", "소집공고", "총회소집"]):
-                rcept_no = item["rcept_no"]
-                report_nm_full = nm
-                rcept_dt = item.get("rcept_dt", "")
-                break
-
-    if not rcept_no:
-        return None, f"주주총회 공시 없음 (corp_code: {corp_code})"
+        # 2순위: 소집공고
+        if not rcept_no:
+            for item in items:
+                report_nm = item.get("report_nm", "")
+                if "주주총회소집공고" in report_nm:
+                    rcept_no = item["rcept_no"]
+                    report_nm_full = report_nm
+                    rcept_dt = item.get("rcept_dt", "")
+                    break
+    
+        # 3순위: 주주총회 관련 모든 공시
+        if not rcept_no:
+            for item in items:
+                nm = item.get("report_nm", "")
+                if any(kw in nm for kw in ["주주총회", "정기총회", "소집결의", "소집공고", "총회소집"]):
+                    rcept_no = item["rcept_no"]
+                    report_nm_full = nm
+                    rcept_dt = item.get("rcept_dt", "")
+                    break
+    
+        if not rcept_no:
+            return None, f"주주총회 공시 없음 (corp_code: {corp_code})"
 
         # document.xml에서 실제 주주총회 개최일 파싱
         agm_date = parse_agm_date_from_xml(api_key, rcept_no)
