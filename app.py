@@ -171,7 +171,25 @@ def get_display_date(company: str, orig: str, state: dict) -> str:
 
 
 # ─────────────────────────────────────────────
-# DART OpenAPI  (문서 제안 방식: document.xml ZIP)
+# 공통 HTTP 헬퍼
+# ─────────────────────────────────────────────
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ko-KR,ko;q=0.9",
+}
+
+def validate_march_2026(d: str) -> bool:
+    """2026-03-DD 형식인지 확인"""
+    return bool(d and re.match(r"2026-03-\d{2}$", d))
+
+
+# ─────────────────────────────────────────────
+# ① DART OpenAPI  (document.xml ZIP 방식)
 # ─────────────────────────────────────────────
 
 def load_corp_codes(api_key: str) -> dict:
@@ -297,10 +315,10 @@ def search_dart_api(company_name: str, api_key: str) -> tuple[str | None, str]:
                 "crtfc_key":      api_key,
                 "corp_code":      corp_code,
                 "bgn_de":         f"{year}0101",
-                "end_de":         f"{year}1231",
-                "last_report_at": "Y",
+                "end_de":         f"{year}0331",  # 3월까지
+                "last_report_at": "N",             # 모든 공시 포함 (최종보고서 한정 X)
                 "page_no":        "1",
-                "page_count":     "20",
+                "page_count":     "100",
             },
             timeout=12,
         )
@@ -339,15 +357,123 @@ def search_dart_api(company_name: str, api_key: str) -> tuple[str | None, str]:
             return None, f"공시 본문 날짜 파싱 실패 ({report_nm})"
 
         # 2026년 3월인지 검증 — 이외 값은 파싱 오류로 처리
-        if not agm_date.startswith("2026-03-"):
+        if not validate_march_2026(agm_date):
             return None, f"날짜 오류: {agm_date} (2026년 3월 아님)"
 
-        return agm_date, f"DART XML ({report_nm})"
+        return agm_date, f"DART ({report_nm})"
 
     except requests.exceptions.ConnectionError:
         return None, "네트워크 오류"
     except Exception as e:
         return None, f"오류: {e}"
+
+
+# ─────────────────────────────────────────────
+# ② K-Vote (한국예탁결제원 전자투표) 크롤링
+# ─────────────────────────────────────────────
+
+def search_kvote(company_name: str) -> tuple[str | None, str]:
+    """
+    evote.ksd.or.kr 주주총회 일정 검색
+    POST /evote/main/agm/agmScheduleList.do
+    """
+    try:
+        url = "https://evote.ksd.or.kr/evote/main/agm/agmScheduleList.do"
+        payload = {
+            "agmSchdSrchCnt": "50",
+            "agmSchdSrchTypCd": "1",   # 1=회사명
+            "srchCrpNm": company_name,
+            "agmSchdSrchYr": "2026",
+        }
+        resp = requests.post(url, data=payload, headers=HEADERS, timeout=12)
+        resp.raise_for_status()
+
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # 테이블 행 순회
+        for tr in soup.select("table tbody tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 4:
+                continue
+            corp_td  = tds[0].get_text(strip=True) if len(tds) > 0 else ""
+            date_td  = tds[2].get_text(strip=True) if len(tds) > 2 else ""  # 주총 일자
+
+            # 회사명 부분 매칭
+            if not (company_name in corp_td or corp_td in company_name):
+                continue
+
+            # 날짜 파싱: "2026.03.19" 또는 "2026-03-19"
+            m = re.search(r"(2026)[.\-/]?(0[1-9]|1[0-2])[.\-/]?(\d{2})", date_td)
+            if m:
+                d = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+                if validate_march_2026(d):
+                    return d, f"K-Vote ({corp_td})"
+
+        # JSON 응답인 경우 대비
+        try:
+            jdata = resp.json()
+            for item in jdata.get("list", []) or jdata.get("data", []):
+                nm = str(item.get("crpNm", "") or item.get("corpNm", ""))
+                dt = str(item.get("agmDt", "") or item.get("agmSchdDt", ""))
+                if company_name in nm or nm in company_name:
+                    m = re.search(r"(\d{4})[.\-](\d{2})[.\-](\d{2})", dt)
+                    if m:
+                        d = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+                        if validate_march_2026(d):
+                            return d, f"K-Vote JSON ({nm})"
+        except Exception:
+            pass
+
+        return None, "K-Vote: 일정 없음"
+
+    except requests.exceptions.ConnectionError:
+        return None, "K-Vote: 네트워크 오류"
+    except Exception as e:
+        return None, f"K-Vote 오류: {e}"
+
+
+# ─────────────────────────────────────────────
+# ③ 교차검증 통합 검색
+# ─────────────────────────────────────────────
+
+def search_agm_date(company_name: str, api_key: str) -> tuple[str | None, str, dict]:
+    """
+    DART + K-Vote 동시 조회 후 교차검증.
+    Returns: (확정날짜 | None, 상태메시지, 상세결과dict)
+    """
+    detail = {"dart": (None, ""), "kvote": (None, "")}
+
+    # DART 조회
+    dart_date, dart_src = search_dart_api(company_name, api_key) if api_key else (None, "API 키 없음")
+    detail["dart"] = (dart_date, dart_src)
+
+    # K-Vote 조회 (API 키 불필요)
+    kvote_date, kvote_src = search_kvote(company_name)
+    detail["kvote"] = (kvote_date, kvote_src)
+
+    dart_ok  = validate_march_2026(dart_date)
+    kvote_ok = validate_march_2026(kvote_date)
+
+    # ── 교차검증 판정 ──
+    if dart_ok and kvote_ok:
+        if dart_date == kvote_date:
+            return dart_date, f"✅ 교차확인 (DART·K-Vote 일치: {dart_date})", detail
+        else:
+            # 불일치 → 둘 다 표시하되 DART 우선
+            return dart_date, f"⚠️ 불일치 DART={dart_date} / K-Vote={kvote_date}", detail
+
+    if dart_ok:
+        return dart_date, f"🟡 DART 단독확인 (K-Vote 미조회)", detail
+
+    if kvote_ok:
+        return kvote_date, f"🟡 K-Vote 단독확인 (DART 공시 미등록)", detail
+
+    # 둘 다 없음
+    msgs = []
+    if dart_src:  msgs.append(f"DART: {dart_src}")
+    if kvote_src: msgs.append(f"K-Vote: {kvote_src}")
+    return None, " / ".join(msgs) or "조회 실패", detail
 
 
 # ─────────────────────────────────────────────
@@ -378,7 +504,8 @@ def build_day_map(df: pd.DataFrame, state: dict) -> dict:
 
 
 def render_calendar_html(year: int, month: int, day_map: dict) -> str:
-    WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
+    # 평일(월~금)만 표시
+    WEEKDAYS = ["월", "화", "수", "목", "금"]
     today_str = date.today().strftime("%Y-%m-%d")
     cal_weeks = calendar.monthcalendar(year, month)
 
@@ -388,9 +515,15 @@ def render_calendar_html(year: int, month: int, day_map: dict) -> str:
     html.append('<th class="week-col">주간<br>합계</th></tr>')
 
     for week in cal_weeks:
-        # 주간 합계
+        weekdays = week[:5]  # index 0~4 = 월~금
+
+        # 평일이 모두 0이면 행 건너뜀
+        if all(d == 0 for d in weekdays):
+            continue
+
+        # 주간 합계 (평일 기준)
         wc, wp = 0, 0
-        for d in week:
+        for d in weekdays:
             if d == 0:
                 continue
             for item in day_map.get(f"{year}-{month:02d}-{d:02d}", []):
@@ -400,36 +533,30 @@ def render_calendar_html(year: int, month: int, day_map: dict) -> str:
                     wp += 1
 
         html.append("<tr>")
-        for idx, d in enumerate(week):
+        for d in weekdays:
             if d == 0:
                 html.append('<td class="empty"></td>')
                 continue
 
-            key = f"{year}-{month:02d}-{d:02d}"
-            items = day_map.get(key, [])
-            total = len(items)
+            key    = f"{year}-{month:02d}-{d:02d}"
+            items  = day_map.get(key, [])
+            total  = len(items)
             conf_n = sum(1 for i in items if i["confirmed"])
             pend_n = total - conf_n
 
-            is_today   = key == today_str
-            is_weekend = idx >= 5   # 토(5), 일(6)
-            td_cls = "today" if is_today else ("weekend" if is_weekend else "")
+            td_cls = "today" if key == today_str else ""
 
-            # 날짜 숫자 + 배지
             badge_html = ""
             if total > 0:
-                badge_cls = "day-badge" + (" has-pending" if pend_n > 0 and conf_n == 0 else "")
+                badge_cls  = "day-badge" + (" has-pending" if pend_n > 0 and conf_n == 0 else "")
                 badge_html = f'<span class="{badge_cls}">{total}</span>'
-            day_color = "#c0392b" if is_weekend else "#374151"
-            cell = (f'<td class="{td_cls}">'
-                    f'<div class="cal-day-num" style="color:{day_color}">'
-                    f'{d}{badge_html}</div>')
 
-            # 기업 chip
+            cell = (f'<td class="{td_cls}">' +
+                    f'<div class="cal-day-num">{d}{badge_html}</div>')
+
             for item in sorted(items, key=lambda x: (not x["confirmed"], not x["required"])):
                 name = item["name"]
                 req  = item["required"]
-
                 if item["updated"]:
                     cls = "chip chip-updated"
                 elif item["confirmed"] and req:
@@ -443,9 +570,8 @@ def render_calendar_html(year: int, month: int, day_map: dict) -> str:
 
                 prefix = "★" if req else ""
                 suffix = "" if item["confirmed"] else " *"
-                title  = name + ("" if item["confirmed"] else " (미정-작년 날짜)")
-                cell += (f'<span class="{cls}" title="{title}">'
-                         f'{prefix}{name}{suffix}</span>')
+                title  = name + ("" if item["confirmed"] else " (미정-작년날짜기준)")
+                cell  += f'<span class="{cls}" title="{title}">{prefix}{name}{suffix}</span>'
 
             cell += "</td>"
             html.append(cell)
@@ -453,10 +579,9 @@ def render_calendar_html(year: int, month: int, day_map: dict) -> str:
         # 주간 합계 셀
         if wc + wp > 0:
             html.append(
-                f'<td class="week-total">'
-                f'<div class="week-cnt">🗓 {wc + wp}</div>'
-                f'<div class="week-sub">확정 {wc}<br>미정 {wp}</div>'
-                f'</td>')
+                f'<td class="week-total">' +
+                f'<div class="week-cnt">🗓 {wc + wp}</div>' +
+                f'<div class="week-sub">확정 {wc}<br>미정 {wp}</div></td>')
         else:
             html.append('<td class="week-total"><span style="color:#ccc">—</span></td>')
 
@@ -464,6 +589,7 @@ def render_calendar_html(year: int, month: int, day_map: dict) -> str:
 
     html.append("</table></div>")
     return "\n".join(html)
+
 
 
 # ─────────────────────────────────────────────
@@ -498,24 +624,24 @@ def render_sidebar(state: dict) -> str:
 
     st.sidebar.markdown("---")
 
-    if st.sidebar.button("🔍 전체 DART 검색", use_container_width=True,
-                          disabled=not dart_api_key):
+    if st.sidebar.button("🔍 전체 교차검증 검색", use_container_width=True):
         df = load_excel_data()
-        try:
-            with st.spinner("기업코드 로딩…"):
-                load_corp_codes(dart_api_key)
-        except Exception as e:
-            st.sidebar.error(str(e))
-            return dart_api_key
+        if dart_api_key:
+            try:
+                with st.spinner("기업코드 로딩…"):
+                    load_corp_codes(dart_api_key)
+            except Exception as e:
+                st.sidebar.error(str(e))
+                return dart_api_key
 
-        prog    = st.sidebar.progress(0)
+        prog  = st.sidebar.progress(0)
         results = {}
-        corps   = df["단체명"].tolist()
+        corps = df["단체명"].tolist()
         for i, corp in enumerate(corps):
-            found, src = search_dart_api(corp, dart_api_key)
-            results[corp] = {"date": found, "source": src}
+            found, status, detail = search_agm_date(corp, dart_api_key)
+            results[corp] = {"date": found, "source": status, "detail": detail}
             prog.progress((i + 1) / len(corps), text=f"{corp}…")
-            time.sleep(0.4)
+            time.sleep(0.5)
         prog.empty()
         st.session_state["crawl_results"] = results
 
@@ -558,7 +684,7 @@ def render_sidebar(state: dict) -> str:
 🟡 노란 칩 = DART 업데이트됨  
 🟠 점선 칩 = 미정 (작년 날짜 기준)  
 ★ = 필수단체  
-\* = 미정 표시
+* = 미정 표시
 """)
 
     return dart_api_key
@@ -624,11 +750,11 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_api_key: str):
                                 unsafe_allow_html=True)
 
             with c3:
-                if st.button("🔍 DART", key=f"dart_{company}",
-                             disabled=not dart_api_key):
-                    with st.spinner(f"{company}…"):
-                        found, src = search_dart_api(company, dart_api_key)
-                        crawl_results[company] = {"date": found, "source": src}
+                if st.button("🔍 교차검증", key=f"dart_{company}"):
+                    with st.spinner(f"{company} 조회 중…"):
+                        found, status, detail = search_agm_date(company, dart_api_key)
+                        crawl_results[company] = {
+                            "date": found, "source": status, "detail": detail}
                         st.session_state["crawl_results"] = crawl_results
                         if found and found != disp:
                             state["overrides"][company] = found
@@ -639,14 +765,24 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_api_key: str):
 
                 if company in crawl_results:
                     res = crawl_results[company]
+                    detail = res.get("detail", {})
+                    dart_d,  dart_s  = detail.get("dart",  (None, ""))
+                    kvote_d, kvote_s = detail.get("kvote", (None, ""))
+
                     if res["date"] and res["date"] != disp:
                         st.markdown(f'<span class="dart-ok">→ {res["date"]}</span>',
                                     unsafe_allow_html=True)
                     elif res["date"]:
                         st.markdown('<span class="dart-same">✓ 동일</span>',
                                     unsafe_allow_html=True)
-                    else:
-                        st.markdown(f'<span class="dart-err">✗ {res["source"]}</span>',
+
+                    # 소스별 결과 미니 표시
+                    dart_icon  = "✅" if validate_march_2026(dart_d)  else "✗"
+                    kvote_icon = "✅" if validate_march_2026(kvote_d) else "✗"
+                    st.caption(f"DART {dart_icon} {dart_d or dart_s[:15]}")
+                    st.caption(f"K-Vote {kvote_icon} {kvote_d or kvote_s[:15]}")
+                    if "⚠️" in res["source"]:
+                        st.markdown(f'<span class="dart-err">{res["source"]}</span>',
                                     unsafe_allow_html=True)
 
             with c4:
