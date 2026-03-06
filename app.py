@@ -234,58 +234,59 @@ def find_corp_code(corp_dict: dict, name: str) -> str | None:
 
 
 def parse_agm_date_from_xml(api_key: str, rcept_no: str) -> str | None:
-    """
-    강화된 정규식으로 주주총회 확정일 추출.
-    태그 기반 파싱 제거, 원문 텍스트 전체에 넓은 패턴 적용.
-    """
+    """강화된 정규식 + '일시' 키워드 우선으로 주주총회 확정일 추출"""
     try:
         resp = requests.get(
             "https://opendart.fss.or.kr/api/document.xml",
-            params={"crtfc_key": api_key,
-                    "rcept_no": rcept_no.replace("-", "")},
-            timeout=20)
+            params={"crtfc_key": api_key, "rcept_no": rcept_no.replace("-", "")},
+            timeout=25
+        )
         resp.raise_for_status()
-
         zf = zipfile.ZipFile(io.BytesIO(resp.content))
         xml_names = [f for f in zf.namelist() if f.lower().endswith(".xml")]
         if not xml_names:
             return None
-
         raw = zf.read(xml_names[0]).decode("utf-8", errors="ignore")
 
-        # 패턴1: "주주총회/정기총회/개최일 ... 2026년 3월 19일" (코나아이 등 실제 문구)
+        # 디버깅용 (필요시 주석 해제)
+        # print(raw[:4000])  # 처음 4000자 출력해서 어디서 날짜 나오는지 확인
+
+        # 0순위: 가장 흔한 패턴 "일시 : 2026년 3월 24일" (셀트리온 등)
+        p0 = re.compile(
+            r"(?:일시|개최일시|총회일시|주주총회\s*일시|소집일시)[:\s]*"
+            r"(\d{4})[년.\s\-]*(\d{1,2})[월.\s\-]*(\d{1,2})",
+            re.IGNORECASE
+        )
+
+        # 당신 기존 패턴들 (이미 좋음)
         p1 = re.compile(
             r"(?:주주총회|정기총회|소집일|개최일|총회일)[^0-9]{0,30}?"
             r"(\d{4})[년.\s\-]*(\d{1,2})[월.\s\-]*(\d{1,2})",
             re.IGNORECASE
         )
-        # 패턴2: "2026. 3. 19." 뒤에 총회/소집/개최
         p2 = re.compile(
             r"(\d{4})[.\-년\s]+(\d{1,2})[.\-월\s]+(\d{1,2})"
             r"[^0-9]{0,30}(?:주주총회|정기총회|소집|개최)",
             re.IGNORECASE
         )
-        # 패턴3: "2026.03.19" / "2026-03-19" 순수 날짜
-        p3 = re.compile(
-            r"\b(2026)[.\-](0?[1-9]|1[0-2])[.\-](0?[1-9]|[12]\d|3[01])\b"
-        )
+        p3 = re.compile(r"\b(2026)[.\-](0?[1-9]|1[0-2])[.\-](0?[1-9]|[12]\d|3[01])\b")
 
-        for pat in [p1, p2, p3]:
+        for pat in [p0, p1, p2, p3]:  # p0을 맨 앞에 → '일시' 우선
             for m in pat.finditer(raw):
                 y, mo, d = m.group(1), m.group(2), m.group(3)
                 date_str = f"{y}-{int(mo):02d}-{int(d):02d}"
                 if validate_march_2026(date_str):
                     return date_str
 
-        # 최후 수단: "2026" + "3" + 일자가 근접한 경우
+        # 최후 수단 (당신 거 유지)
         m = re.search(r"2026[.\s\-년]*0?3[.\s\-월]*([0-2]?\d|3[01])[.\s일]*", raw)
         if m:
             candidate = f"2026-03-{int(m.group(1)):02d}"
             if validate_march_2026(candidate):
                 return candidate
 
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"parse_agm_date 오류: {e}")  # 디버깅용
     return None
 
 
@@ -331,35 +332,37 @@ def search_dart_api(company_name: str, api_key: str) -> tuple[str | None, str]:
 
         items = data.get("list", [])
 
-        # 1순위: 소집결의
-        rcept_no = report_nm = rcept_dt = ""
+        # 1순위: 소집결의 (정정 포함)
+    for item in items:
+        report_nm = item.get("report_nm", "")
+        if "주주총회소집결의" in report_nm or "[기재정정]주주총회소집결의" in report_nm:
+            rcept_no = item["rcept_no"]
+            report_nm_full = report_nm
+            rcept_dt = item.get("rcept_dt", "")  # 참고용
+            break
+
+    # 2순위: 소집공고
+    if not rcept_no:
         for item in items:
-            if "주주총회소집결의" in item.get("report_nm", ""):
-                rcept_no  = item["rcept_no"]
-                report_nm = item["report_nm"]
-                rcept_dt  = item.get("rcept_dt", "")
+            report_nm = item.get("report_nm", "")
+            if "주주총회소집공고" in report_nm:
+                rcept_no = item["rcept_no"]
+                report_nm_full = report_nm
+                rcept_dt = item.get("rcept_dt", "")
                 break
 
-        # 2순위: 소집공고
-        if not rcept_no:
-            for item in items:
-                if "주주총회소집공고" in item.get("report_nm", ""):
-                    rcept_no  = item["rcept_no"]
-                    report_nm = item["report_nm"]
-                    rcept_dt  = item.get("rcept_dt", "")
-                    break
+    # 3순위: 주주총회 관련 모든 공시
+    if not rcept_no:
+        for item in items:
+            nm = item.get("report_nm", "")
+            if any(kw in nm for kw in ["주주총회", "정기총회", "소집결의", "소집공고", "총회소집"]):
+                rcept_no = item["rcept_no"]
+                report_nm_full = nm
+                rcept_dt = item.get("rcept_dt", "")
+                break
 
-        # 3순위: 주주총회/정기총회/소집 포함 모든 공시
-        if not rcept_no:
-            for item in items:
-                nm = item.get("report_nm", "")
-                if any(kw in nm for kw in ["주주총회", "정기총회", "소집결의", "소집공고"]):
-                    rcept_no  = item["rcept_no"]
-                    report_nm = nm
-                    rcept_dt  = item.get("rcept_dt", "")
-                    break
-        if not rcept_no:
-            return None, f"주주총회 공시 없음 (corp_code: {corp_code})"
+    if not rcept_no:
+        return None, f"주주총회 공시 없음 (corp_code: {corp_code})"
 
         # document.xml에서 실제 주주총회 개최일 파싱
         agm_date = parse_agm_date_from_xml(api_key, rcept_no)
@@ -383,61 +386,34 @@ def search_dart_api(company_name: str, api_key: str) -> tuple[str | None, str]:
 # ② K-Vote (한국예탁결제원 전자투표) 크롤링
 # ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+# ② K-Vote (한국예탁결제원 전자투표) 크롤링
+# ─────────────────────────────────────────────
 def search_kvote(company_name: str) -> tuple[str | None, str]:
-    """
-    evote.ksd.or.kr 주주총회 일정 검색
-    POST /evote/main/agm/agmScheduleList.do
-    """
+    """ evote.ksd.or.kr 주주총회 일정 검색 POST /evote/main/agm/agmScheduleList.do """
+    
+    # ← 여기! 함수 맨 위(try 바로 위 또는 바로 아래)에 추가
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://evote.ksd.or.kr/",
+        "Connection": "keep-alive"
+    }
+    
     try:
         url = "https://evote.ksd.or.kr/evote/main/agm/agmScheduleList.do"
         payload = {
             "agmSchdSrchCnt": "50",
-            "agmSchdSrchTypCd": "1",   # 1=회사명
+            "agmSchdSrchTypCd": "1",  # 1=회사명
             "srchCrpNm": company_name,
             "agmSchdSrchYr": "2026",
         }
         resp = requests.post(url, data=payload, headers=HEADERS, timeout=12)
         resp.raise_for_status()
-
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # 테이블 행 순회
-        for tr in soup.select("table tbody tr"):
-            tds = tr.find_all("td")
-            if len(tds) < 4:
-                continue
-            corp_td  = tds[0].get_text(strip=True) if len(tds) > 0 else ""
-            date_td  = tds[2].get_text(strip=True) if len(tds) > 2 else ""  # 주총 일자
-
-            # 회사명 부분 매칭
-            if not (company_name in corp_td or corp_td in company_name):
-                continue
-
-            # 날짜 파싱: "2026.03.19" 또는 "2026-03-19"
-            m = re.search(r"(2026)[.\-/]?(0[1-9]|1[0-2])[.\-/]?(\d{2})", date_td)
-            if m:
-                d = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-                if validate_march_2026(d):
-                    return d, f"K-Vote ({corp_td})"
-
-        # JSON 응답인 경우 대비
-        try:
-            jdata = resp.json()
-            for item in jdata.get("list", []) or jdata.get("data", []):
-                nm = str(item.get("crpNm", "") or item.get("corpNm", ""))
-                dt = str(item.get("agmDt", "") or item.get("agmSchdDt", ""))
-                if company_name in nm or nm in company_name:
-                    m = re.search(r"(\d{4})[.\-](\d{2})[.\-](\d{2})", dt)
-                    if m:
-                        d = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-                        if validate_march_2026(d):
-                            return d, f"K-Vote JSON ({nm})"
-        except Exception:
-            pass
-
-        return None, "K-Vote: 일정 없음"
-
+        
+        # ... (나머지 코드 그대로: BeautifulSoup 파싱, JSON 대비 등)
+        
     except requests.exceptions.ConnectionError:
         return None, "K-Vote: 네트워크 오류"
     except Exception as e:
