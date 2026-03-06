@@ -235,8 +235,8 @@ def find_corp_code(corp_dict: dict, name: str) -> str | None:
 
 def parse_agm_date_from_xml(api_key: str, rcept_no: str) -> str | None:
     """
-    /api/document.xml → ZIP → XML 태그 파싱으로 주주총회 확정일 추출.
-    태그 패턴: 주주총회일자, 주총일, 소집일자, 개최일자 등
+    강화된 정규식으로 주주총회 확정일 추출.
+    태그 기반 파싱 제거, 원문 텍스트 전체에 넓은 패턴 적용.
     """
     try:
         resp = requests.get(
@@ -251,41 +251,43 @@ def parse_agm_date_from_xml(api_key: str, rcept_no: str) -> str | None:
         if not xml_names:
             return None
 
-        xml_bytes = zf.read(xml_names[0])
+        raw = zf.read(xml_names[0]).decode("utf-8", errors="ignore")
 
-        # 방법1: XML 태그 파싱
-        DATE_TAGS = ("주주총회일자", "주총일", "소집일자", "개최일자",
-                     "주주총회_개최일자", "총회일자", "주주총회일")
-        try:
-            root = ET.fromstring(xml_bytes)
-            for elem in root.iter():
-                tag  = elem.tag.split("}")[-1]
-                text = (elem.text or "").strip()
-                if any(kw in tag for kw in DATE_TAGS) and text:
-                    m = re.search(
-                        r"(\d{4})[.\-년\s]+(\d{1,2})[.\-월\s]+(\d{1,2})", text)
-                    if m:
-                        return (f"{m.group(1)}-"
-                                f"{int(m.group(2)):02d}-"
-                                f"{int(m.group(3)):02d}")
-        except ET.ParseError:
-            pass
+        # 패턴1: "주주총회/정기총회/개최일 ... 2026년 3월 19일" (코나아이 등 실제 문구)
+        p1 = re.compile(
+            r"(?:주주총회|정기총회|소집일|개최일|총회일)[^0-9]{0,30}?"
+            r"(\d{4})[년.\s\-]*(\d{1,2})[월.\s\-]*(\d{1,2})",
+            re.IGNORECASE
+        )
+        # 패턴2: "2026. 3. 19." 뒤에 총회/소집/개최
+        p2 = re.compile(
+            r"(\d{4})[.\-년\s]+(\d{1,2})[.\-월\s]+(\d{1,2})"
+            r"[^0-9]{0,30}(?:주주총회|정기총회|소집|개최)",
+            re.IGNORECASE
+        )
+        # 패턴3: "2026.03.19" / "2026-03-19" 순수 날짜
+        p3 = re.compile(
+            r"\b(2026)[.\-](0?[1-9]|1[0-2])[.\-](0?[1-9]|[12]\d|3[01])\b"
+        )
 
-        # 방법2: 원시 텍스트 정규식
-        raw = xml_bytes.decode("utf-8", errors="ignore")
-        for pat in [
-            r"주주총회\s*일시[^0-9]*(\d{4})[년.\s\-]+(\d{1,2})[월.\s\-]+(\d{1,2})",
-            r"개최\s*일시[^0-9]*(\d{4})[년.\s\-]+(\d{1,2})[월.\s\-]+(\d{1,2})",
-            r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일.*?주주총회",
-        ]:
-            m = re.search(pat, raw)
-            if m:
-                return (f"{m.group(1)}-"
-                        f"{int(m.group(2)):02d}-"
-                        f"{int(m.group(3)):02d}")
+        for pat in [p1, p2, p3]:
+            for m in pat.finditer(raw):
+                y, mo, d = m.group(1), m.group(2), m.group(3)
+                date_str = f"{y}-{int(mo):02d}-{int(d):02d}"
+                if validate_march_2026(date_str):
+                    return date_str
+
+        # 최후 수단: "2026" + "3" + 일자가 근접한 경우
+        m = re.search(r"2026[.\s\-년]*0?3[.\s\-월]*([0-2]?\d|3[01])[.\s일]*", raw)
+        if m:
+            candidate = f"2026-03-{int(m.group(1)):02d}"
+            if validate_march_2026(candidate):
+                return candidate
+
     except Exception:
         pass
     return None
+
 
 
 def search_dart_api(company_name: str, api_key: str) -> tuple[str | None, str]:
@@ -329,8 +331,8 @@ def search_dart_api(company_name: str, api_key: str) -> tuple[str | None, str]:
 
         items = data.get("list", [])
 
-        # 1순위: 주주총회소집결의
-        rcept_no = report_nm = ""
+        # 1순위: 소집결의
+        rcept_no = report_nm = rcept_dt = ""
         for item in items:
             if "주주총회소집결의" in item.get("report_nm", ""):
                 rcept_no  = item["rcept_no"]
@@ -338,15 +340,24 @@ def search_dart_api(company_name: str, api_key: str) -> tuple[str | None, str]:
                 rcept_dt  = item.get("rcept_dt", "")
                 break
 
-        # 2순위: 주주총회 포함 모든 공시
+        # 2순위: 소집공고
         if not rcept_no:
             for item in items:
-                if "주주총회" in item.get("report_nm", ""):
+                if "주주총회소집공고" in item.get("report_nm", ""):
                     rcept_no  = item["rcept_no"]
                     report_nm = item["report_nm"]
                     rcept_dt  = item.get("rcept_dt", "")
                     break
 
+        # 3순위: 주주총회/정기총회/소집 포함 모든 공시
+        if not rcept_no:
+            for item in items:
+                nm = item.get("report_nm", "")
+                if any(kw in nm for kw in ["주주총회", "정기총회", "소집결의", "소집공고"]):
+                    rcept_no  = item["rcept_no"]
+                    report_nm = nm
+                    rcept_dt  = item.get("rcept_dt", "")
+                    break
         if not rcept_no:
             return None, f"주주총회 공시 없음 (corp_code: {corp_code})"
 
