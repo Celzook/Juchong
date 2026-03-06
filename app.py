@@ -4,11 +4,11 @@ import json
 import os
 import re
 import time
+import calendar
 import zipfile
 import io
 import xml.etree.ElementTree as ET
 import requests
-from bs4 import BeautifulSoup
 from datetime import datetime, date
 
 # ─────────────────────────────────────────────
@@ -16,104 +16,94 @@ from datetime import datetime, date
 # ─────────────────────────────────────────────
 st.set_page_config(
     page_title="주주총회 일정 트래커",
-    page_icon="📋",
+    page_icon="📅",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 EXCEL_PATH = "주주총회.xlsx"
 STATE_PATH = "agm_state.json"
+CORP_CACHE = "dart_corp_codes.json"
 
 # ─────────────────────────────────────────────
 # CSS
 # ─────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;600;700&display=swap');
+* { font-family: 'Noto Sans KR', sans-serif; box-sizing: border-box; }
 
-* { font-family: 'Noto Sans KR', sans-serif; }
-
-@keyframes highlight-pulse {
-    0%   { background-color: #ffe066; }
-    50%  { background-color: #fff9c4; }
-    100% { background-color: #ffe066; }
+@keyframes pulse-gold {
+  0%,100% { background:#ffe066; } 50% { background:#fff3a0; }
 }
-
 .updated-badge {
-    display: inline-block;
-    background-color: #ffe066;
-    color: #7a5800;
-    font-weight: 700;
-    font-size: 0.82em;
-    padding: 1px 8px;
-    border-radius: 12px;
-    margin-left: 6px;
-    animation: highlight-pulse 1.2s ease-in-out 4;
-    border: 1px solid #f5c518;
+  display:inline-block; background:#ffe066; color:#7a5800;
+  font-weight:700; font-size:.75em; padding:1px 7px; border-radius:10px;
+  margin-left:5px; border:1px solid #f5c518;
+  animation: pulse-gold 1.1s ease-in-out 5;
 }
 
-.date-confirmed {
-    color: #1a7f37;
-    font-weight: 600;
+/* ─── 달력 ─── */
+.cal-wrap { overflow-x: auto; }
+table.cal {
+  width: 100%; border-collapse: collapse; table-layout: fixed;
 }
-.date-pending {
-    color: #9a6700;
-    font-style: italic;
+table.cal th {
+  background: #1e3a5f; color: #fff; text-align: center;
+  padding: 8px 4px; font-size: .82em; font-weight: 600;
 }
-.required-badge {
-    display: inline-block;
-    background-color: #fde8e8;
-    color: #c53030;
-    font-size: 0.78em;
-    padding: 1px 7px;
-    border-radius: 10px;
-    border: 1px solid #f5a5a5;
-    margin-left: 4px;
+table.cal th.week-col { background: #0f2540; font-size: .78em; }
+table.cal td {
+  vertical-align: top; border: 1px solid #dde3ed;
+  padding: 5px 5px 8px 5px; background: #fff;
+  font-size: .8em; width: 13%;
 }
-.prev-company-block {
-    background: #f1f5f9;
-    border-left: 4px solid #94a3b8;
-    border-radius: 0 6px 6px 0;
-    padding: 8px 14px;
-    margin: 4px 0 10px 0;
-    font-size: 0.88em;
-    color: #475569;
+table.cal td.week-total {
+  background: #f0f4fa; text-align: center; vertical-align: middle;
+  font-weight: 700; color: #1e3a5f; font-size: .85em; width: 4%;
+  border: 1px solid #c5d0e0;
 }
-.row-card {
-    background: #fff;
-    border: 1px solid #e5e7eb;
-    border-radius: 8px;
-    padding: 8px 14px;
-    margin-bottom: 6px;
-    transition: box-shadow 0.2s;
+table.cal td.empty { background: #f8f9fc; }
+table.cal td.today { background: #fffbe6; border: 2px solid #f5c518; }
+table.cal td.weekend { background: #fafafa; }
+
+.cal-day-num {
+  font-weight: 700; font-size: .9em; color: #374151; margin-bottom: 4px;
+  display: flex; align-items: center; gap: 4px;
 }
-.row-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-.section-header {
-    font-size: 1em;
-    font-weight: 700;
-    color: #374151;
-    padding: 6px 0 2px 0;
-    border-bottom: 2px solid #e5e7eb;
-    margin-bottom: 8px;
+.day-badge {
+  background: #1e3a5f; color: #fff; font-size: .7em; font-weight: 700;
+  border-radius: 8px; padding: 1px 6px; min-width: 22px; text-align: center;
 }
-.crawl-new {
-    background-color: #dcfce7;
-    color: #166534;
-    font-weight: 600;
-    padding: 2px 8px;
-    border-radius: 8px;
-    font-size: 0.9em;
+.day-badge.has-pending { background: #b45309; }
+
+.chip {
+  display: inline-block; border-radius: 10px; padding: 2px 7px;
+  margin: 2px 2px 0 0; font-size: .73em; font-weight: 500; line-height: 1.6;
+  cursor: default; max-width: 100%; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
 }
-.crawl-same {
-    color: #6b7280;
-    font-size: 0.9em;
-}
+.chip-confirmed        { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
+.chip-confirmed.req    { background: #dbeafe; color: #1e40af; border: 1px solid #93c5fd; }
+.chip-updated          { background: #fef9c3; color: #854d0e; border: 1.5px solid #fde047; }
+.chip-pending          { background: #fff7ed; color: #9a3412; border: 1px dashed #fdba74; font-style: italic; }
+.chip-pending.req      { background: #fef3c7; color: #92400e; border: 1px dashed #fcd34d; }
+
+.week-cnt  { font-size: 1.15em; }
+.week-sub  { font-size: .68em; color: #64748b; margin-top: 3px; }
+
+/* ─── 리스트 뷰 ─── */
+.date-conf { color: #166534; font-weight: 600; }
+.date-pend { color: #9a3412;  font-style: italic; }
+.dart-ok   { background: #dcfce7; color: #166534; font-size: .78em; padding: 2px 8px; border-radius: 8px; font-weight: 600; }
+.dart-same { color: #6b7280; font-size: .78em; }
+.dart-err  { color: #dc2626; font-size: .78em; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
-# 데이터 로드 및 상태 관리
+# 데이터 로드 / 상태 관리
 # ─────────────────────────────────────────────
 
 @st.cache_data
@@ -136,15 +126,10 @@ def load_state():
     if os.path.exists(STATE_PATH):
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        # updated_recently → set
         raw["updated_recently"] = set(raw.get("updated_recently", []))
         return raw
-    return {
-        "overrides": {},       # company → new date string
-        "changes": {},         # current_company → prev_company info
-        "updated_recently": set(),
-        "updated_timestamps": {},
-    }
+    return {"overrides": {}, "changes": {}, "updated_recently": set(),
+            "updated_timestamps": {}, "name_replacements": {}}
 
 
 def save_state(state):
@@ -155,118 +140,131 @@ def save_state(state):
 
 
 def init_session():
-    if "state" not in st.session_state:
-        st.session_state["state"] = load_state()
-    if "change_modal" not in st.session_state:
-        st.session_state["change_modal"] = None   # company being changed
-    if "expanded_prev" not in st.session_state:
-        st.session_state["expanded_prev"] = set()
-    if "crawl_results" not in st.session_state:
-        st.session_state["crawl_results"] = {}
+    for key, val in [
+        ("state",         load_state()),
+        ("change_modal",  None),
+        ("expanded_prev", set()),
+        ("crawl_results", {}),
+    ]:
+        if key not in st.session_state:
+            st.session_state[key] = val
 
 
 # ─────────────────────────────────────────────
-# DART OpenAPI
+# 날짜 유틸
 # ─────────────────────────────────────────────
 
-CORP_CODE_CACHE_PATH = "dart_corp_codes.json"
-
-def load_corp_codes(api_key: str) -> dict:
-    """
-    DART 전체 기업코드 목록을 다운로드하여 {기업명: corp_code} 딕셔너리 반환.
-    로컬 캐시(dart_corp_codes.json) 있으면 재사용.
-    """
-    # 캐시 확인 (하루 이내)
-    if os.path.exists(CORP_CODE_CACHE_PATH):
-        mtime = os.path.getmtime(CORP_CODE_CACHE_PATH)
-        if time.time() - mtime < 86400:  # 24시간
-            with open(CORP_CODE_CACHE_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-
-    url = f"https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key={api_key}"
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-
-    # ZIP 압축 해제 후 XML 파싱
-    zf = zipfile.ZipFile(io.BytesIO(resp.content))
-    xml_data = zf.read("CORPCODE.xml")
-    root = ET.fromstring(xml_data)
-
-    corp_dict = {}
-    for item in root.findall("list"):
-        corp_name = item.findtext("corp_name", "").strip()
-        corp_code = item.findtext("corp_code", "").strip()
-        stock_code = item.findtext("stock_code", "").strip()
-        if corp_name and corp_code and stock_code:  # 상장사만
-            corp_dict[corp_name] = corp_code
-
-    # 캐시 저장
-    with open(CORP_CODE_CACHE_PATH, "w", encoding="utf-8") as f:
-        json.dump(corp_dict, f, ensure_ascii=False)
-
-    return corp_dict
+def is_confirmed(s: str) -> bool:
+    return bool(re.match(r"\d{4}-\d{2}-\d{2}", str(s)))
 
 
-def find_corp_code(corp_dict: dict, company_name: str) -> str | None:
-    """
-    정확 매칭 → 부분 매칭 순으로 corp_code 탐색.
-    예: 'NAVER' → 'NAVER' 정확 매칭, '현대모비스' → 정확 매칭
-    """
-    # 1) 정확 매칭
-    if company_name in corp_dict:
-        return corp_dict[company_name]
-
-    # 2) 대소문자 무시 정확 매칭
-    lower_name = company_name.lower()
-    for k, v in corp_dict.items():
-        if k.lower() == lower_name:
-            return v
-
-    # 3) 부분 문자열 매칭 (입력값이 사전 키에 포함)
-    candidates = [(k, v) for k, v in corp_dict.items() if company_name in k or k in company_name]
-    if len(candidates) == 1:
-        return candidates[0][1]
-    if len(candidates) > 1:
-        # 길이가 가장 가까운 것 선택
-        candidates.sort(key=lambda x: abs(len(x[0]) - len(company_name)))
-        return candidates[0][1]
-
+def extract_pending_date(date_str: str, target_year: int = 2026) -> str | None:
+    """'미정 (25.3.20)' → '2026-03-20'"""
+    m = re.search(r"(\d{1,2})\.(\d{1,2})", str(date_str))
+    if m:
+        return f"{target_year}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
     return None
 
 
-def parse_agm_date_from_doc(api_key: str, rcept_no: str) -> str | None:
+def get_display_date(company: str, orig: str, state: dict) -> str:
+    return state["overrides"].get(company, orig)
+
+
+# ─────────────────────────────────────────────
+# DART OpenAPI  (문서 제안 방식: document.xml ZIP)
+# ─────────────────────────────────────────────
+
+def load_corp_codes(api_key: str) -> dict:
+    if os.path.exists(CORP_CACHE):
+        if time.time() - os.path.getmtime(CORP_CACHE) < 86400:
+            with open(CORP_CACHE, "r", encoding="utf-8") as f:
+                return json.load(f)
+
+    resp = requests.get(
+        f"https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key={api_key}",
+        timeout=30)
+    resp.raise_for_status()
+
+    root = ET.fromstring(
+        zipfile.ZipFile(io.BytesIO(resp.content)).read("CORPCODE.xml"))
+
+    corp_dict = {}
+    for item in root.findall("list"):
+        name  = item.findtext("corp_name",  "").strip()
+        code  = item.findtext("corp_code",  "").strip()
+        stock = item.findtext("stock_code", "").strip()
+        if name and code and stock:
+            corp_dict[name] = code
+
+    with open(CORP_CACHE, "w", encoding="utf-8") as f:
+        json.dump(corp_dict, f, ensure_ascii=False)
+    return corp_dict
+
+
+def find_corp_code(corp_dict: dict, name: str) -> str | None:
+    if name in corp_dict:
+        return corp_dict[name]
+    low = name.lower()
+    for k, v in corp_dict.items():
+        if k.lower() == low:
+            return v
+    cands = [(k, v) for k, v in corp_dict.items() if name in k or k in name]
+    if cands:
+        cands.sort(key=lambda x: abs(len(x[0]) - len(name)))
+        return cands[0][1]
+    return None
+
+
+def parse_agm_date_from_xml(api_key: str, rcept_no: str) -> str | None:
     """
-    공시 문서 본문에서 실제 주주총회 개최 일시를 파싱.
-    Returns 'YYYY-MM-DD' or None
+    /api/document.xml → ZIP → XML 태그 파싱으로 주주총회 확정일 추출.
+    태그 패턴: 주주총회일자, 주총일, 소집일자, 개최일자 등
     """
     try:
-        # 문서 목록 조회
-        doc_list_url = "https://opendart.fss.or.kr/api/document.json"
-        r = requests.get(doc_list_url, params={"crtfc_key": api_key, "rcept_no": rcept_no}, timeout=10)
-        docs = r.json()
-        if docs.get("status") != "000":
+        resp = requests.get(
+            "https://opendart.fss.or.kr/api/document.xml",
+            params={"crtfc_key": api_key,
+                    "rcept_no": rcept_no.replace("-", "")},
+            timeout=20)
+        resp.raise_for_status()
+
+        zf = zipfile.ZipFile(io.BytesIO(resp.content))
+        xml_names = [f for f in zf.namelist() if f.lower().endswith(".xml")]
+        if not xml_names:
             return None
 
-        # 첫 번째 문서 HTML 가져오기
-        for doc in docs.get("list", [])[:3]:
-            dcm_no = doc.get("dcm_no")
-            if not dcm_no:
-                continue
-            viewer_url = f"https://dart.fss.or.kr/report/viewer.do?rcpNo={rcept_no}&dcmNo={dcm_no}&eleId=0&offset=0&length=0&dtd=dart3.xsd"
-            rv = requests.get(viewer_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-            soup = BeautifulSoup(rv.text, "html.parser")
-            text = soup.get_text(" ", strip=True)
+        xml_bytes = zf.read(xml_names[0])
 
-            # "주주총회 일시" 또는 "개최일시" 등 패턴 탐색
-            patterns = [
-                r"(?:주주총회\s*일시|개최일시|회의일시)[^\d]*(\d{4})[년.\s-]+(\d{1,2})[월.\s-]+(\d{1,2})",
-                r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일.*?(?:주주총회|정기총회)",
-            ]
-            for pat in patterns:
-                m = re.search(pat, text)
-                if m:
-                    y, mo, d = m.group(1), m.group(2).zfill(2), m.group(3).zfill(2)
-                    return f"{y}-{mo}-{d}"
+        # 방법1: XML 태그 파싱
+        DATE_TAGS = ("주주총회일자", "주총일", "소집일자", "개최일자",
+                     "주주총회_개최일자", "총회일자", "주주총회일")
+        try:
+            root = ET.fromstring(xml_bytes)
+            for elem in root.iter():
+                tag  = elem.tag.split("}")[-1]
+                text = (elem.text or "").strip()
+                if any(kw in tag for kw in DATE_TAGS) and text:
+                    m = re.search(
+                        r"(\d{4})[.\-년\s]+(\d{1,2})[.\-월\s]+(\d{1,2})", text)
+                    if m:
+                        return (f"{m.group(1)}-"
+                                f"{int(m.group(2)):02d}-"
+                                f"{int(m.group(3)):02d}")
+        except ET.ParseError:
+            pass
+
+        # 방법2: 원시 텍스트 정규식
+        raw = xml_bytes.decode("utf-8", errors="ignore")
+        for pat in [
+            r"주주총회\s*일시[^0-9]*(\d{4})[년.\s\-]+(\d{1,2})[월.\s\-]+(\d{1,2})",
+            r"개최\s*일시[^0-9]*(\d{4})[년.\s\-]+(\d{1,2})[월.\s\-]+(\d{1,2})",
+            r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일.*?주주총회",
+        ]:
+            m = re.search(pat, raw)
+            if m:
+                return (f"{m.group(1)}-"
+                        f"{int(m.group(2)):02d}-"
+                        f"{int(m.group(3)):02d}")
     except Exception:
         pass
     return None
@@ -274,11 +272,9 @@ def parse_agm_date_from_doc(api_key: str, rcept_no: str) -> str | None:
 
 def search_dart_api(company_name: str, api_key: str) -> tuple[str | None, str]:
     """
-    DART OpenAPI로 주주총회 날짜 탐색.
-    1단계: 기업명 → corp_code 변환
-    2단계: corp_code로 주주총회소집공고(G003) 공시 목록 조회
-    3단계: 공시 본문에서 실제 주주총회 개최일 파싱
-    Returns (date_str | None, source_str)
+    ① corp_code 조회
+    ② list.json에서 '주주총회소집결의' report_nm 검색
+    ③ document.xml ZIP 다운로드 → XML 태그 파싱
     """
     if not api_key:
         return None, "API 키 없음"
@@ -286,102 +282,189 @@ def search_dart_api(company_name: str, api_key: str) -> tuple[str | None, str]:
     year = datetime.now().year
 
     try:
-        # ── 1단계: corp_code 조회 ──
-        with st.spinner(f"기업코드 조회 중…"):
-            corp_dict = load_corp_codes(api_key)
+        corp_dict = load_corp_codes(api_key)
+    except Exception as e:
+        return None, f"기업코드 로드 실패: {e}"
 
-        corp_code = find_corp_code(corp_dict, company_name)
-        if not corp_code:
-            return None, f"기업코드 없음 ('{company_name}' 미매칭)"
+    corp_code = find_corp_code(corp_dict, company_name)
+    if not corp_code:
+        return None, f"기업코드 미발견 ('{company_name}')"
 
-        # ── 2단계: 공시 목록 조회 ──
-        list_url = "https://opendart.fss.or.kr/api/list.json"
-        params = {
-            "crtfc_key": api_key,
-            "corp_code": corp_code,          # ← corp_code 사용 (핵심 수정)
-            "bgn_de": f"{year}0101",
-            "end_de": f"{year}1231",
-            "pblntf_detail_ty": "G003",      # 주주총회소집공고
-            "page_count": 10,
-        }
-        resp = requests.get(list_url, params=params, timeout=12)
+    try:
+        resp = requests.get(
+            "https://opendart.fss.or.kr/api/list.json",
+            params={
+                "crtfc_key":      api_key,
+                "corp_code":      corp_code,
+                "bgn_de":         f"{year}0101",
+                "end_de":         f"{year}1231",
+                "last_report_at": "Y",
+                "page_no":        "1",
+                "page_count":     "20",
+            },
+            timeout=12,
+        )
         data = resp.json()
 
-        if data.get("status") != "000" or not data.get("list"):
-            # G003 없으면 G004(주주총회결과)도 시도
-            params["pblntf_detail_ty"] = "G004"
-            resp2 = requests.get(list_url, params=params, timeout=12)
-            data2 = resp2.json()
-            if data2.get("status") != "000" or not data2.get("list"):
-                return None, f"공시 없음 (corp_code: {corp_code})"
-            data = data2
+        if data.get("status") != "000":
+            return None, f"DART 오류: {data.get('message', '')}"
 
-        filing = data["list"][0]
-        rcept_no = filing.get("rcept_no", "")
-        report_nm = filing.get("report_nm", "")
-        rcept_dt_raw = filing.get("rcept_dt", "")
+        items = data.get("list", [])
 
-        # ── 3단계: 문서 본문에서 실제 주주총회 날짜 파싱 ──
-        agm_date = None
-        if rcept_no:
-            agm_date = parse_agm_date_from_doc(api_key, rcept_no)
+        # 1순위: 주주총회소집결의
+        rcept_no = report_nm = ""
+        for item in items:
+            if "주주총회소집결의" in item.get("report_nm", ""):
+                rcept_no  = item["rcept_no"]
+                report_nm = item["report_nm"]
+                rcept_dt  = item.get("rcept_dt", "")
+                break
 
+        # 2순위: 주주총회 포함 모든 공시
+        if not rcept_no:
+            for item in items:
+                if "주주총회" in item.get("report_nm", ""):
+                    rcept_no  = item["rcept_no"]
+                    report_nm = item["report_nm"]
+                    rcept_dt  = item.get("rcept_dt", "")
+                    break
+
+        if not rcept_no:
+            return None, f"주주총회 공시 없음 (corp_code: {corp_code})"
+
+        # document.xml 파싱
+        agm_date = parse_agm_date_from_xml(api_key, rcept_no)
         if agm_date:
-            return agm_date, f"DART ({report_nm}, 본문 파싱)"
+            return agm_date, f"DART XML ({report_nm})"
 
-        # 본문 파싱 실패 시 접수일로 fallback
-        m = re.match(r"(\d{4})(\d{2})(\d{2})", rcept_dt_raw)
+        # fallback: 접수일
+        m = re.match(r"(\d{4})(\d{2})(\d{2})", rcept_dt)
         if m:
-            fallback_date = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-            return fallback_date, f"DART ({report_nm}, 접수일 기준)"
+            return (f"{m.group(1)}-{m.group(2)}-{m.group(3)}",
+                    f"DART 접수일 기준 ({report_nm})")
 
         return None, "날짜 파싱 실패"
 
     except requests.exceptions.ConnectionError:
         return None, "네트워크 오류"
     except Exception as e:
-        return None, f"API 오류: {str(e)}"
+        return None, f"오류: {e}"
 
 
 # ─────────────────────────────────────────────
-# UI 헬퍼
+# 달력 뷰
 # ─────────────────────────────────────────────
 
-def is_confirmed_date(date_str: str) -> bool:
-    return bool(re.match(r"\d{4}-\d{2}-\d{2}", date_str))
+def build_day_map(df: pd.DataFrame, state: dict) -> dict:
+    day_map: dict[str, list] = {}
+    for _, row in df.iterrows():
+        company  = row["단체명"]
+        orig     = row["주주총회일"]
+        required = row["비고"] == "필수단체"
+        disp     = get_display_date(company, orig, state)
+        updated  = company in state.get("updated_recently", set())
+
+        if is_confirmed(disp):
+            key, confirmed = disp, True
+        else:
+            key = extract_pending_date(orig)
+            confirmed = False
+
+        if key:
+            day_map.setdefault(key, []).append(
+                {"name": company, "required": required,
+                 "confirmed": confirmed, "updated": updated}
+            )
+    return day_map
 
 
-def render_date(company: str, date_str: str, state: dict) -> str:
-    overrides = state["overrides"]
-    updated_recently = state.get("updated_recently", set())
+def render_calendar_html(year: int, month: int, day_map: dict) -> str:
+    WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
+    today_str = date.today().strftime("%Y-%m-%d")
+    cal_weeks = calendar.monthcalendar(year, month)
 
-    display_date = overrides.get(company, date_str)
-    badge = ""
-    if company in updated_recently:
-        badge = '<span class="updated-badge">🔄 업데이트됨</span>'
+    html = ['<div class="cal-wrap"><table class="cal"><tr>']
+    for wd in WEEKDAYS:
+        html.append(f"<th>{wd}</th>")
+    html.append('<th class="week-col">주간<br>합계</th></tr>')
 
-    if is_confirmed_date(display_date):
-        return f'<span class="date-confirmed">{display_date}</span>{badge}'
-    else:
-        return f'<span class="date-pending">{display_date}</span>{badge}'
+    for week in cal_weeks:
+        # 주간 합계
+        wc, wp = 0, 0
+        for d in week:
+            if d == 0:
+                continue
+            for item in day_map.get(f"{year}-{month:02d}-{d:02d}", []):
+                if item["confirmed"]:
+                    wc += 1
+                else:
+                    wp += 1
 
+        html.append("<tr>")
+        for idx, d in enumerate(week):
+            if d == 0:
+                html.append('<td class="empty"></td>')
+                continue
 
-def apply_company_change(state: dict, old_name: str, new_name: str, original_date: str):
-    """기업 변경: old_name → new_name, old_name은 '변경 1회 전 기업'으로"""
-    changes = state.setdefault("changes", {})
-    overrides = state.setdefault("overrides", {})
+            key = f"{year}-{month:02d}-{d:02d}"
+            items = day_map.get(key, [])
+            total = len(items)
+            conf_n = sum(1 for i in items if i["confirmed"])
+            pend_n = total - conf_n
 
-    # 이전 기업 정보 저장
-    changes[new_name] = {
-        "prev_name": old_name,
-        "prev_date": overrides.get(old_name, original_date),
-        "changed_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-    }
-    # 이전 기업 overrides 정리
-    if old_name in overrides:
-        del overrides[old_name]
+            is_today   = key == today_str
+            is_weekend = idx >= 5   # 토(5), 일(6)
+            td_cls = "today" if is_today else ("weekend" if is_weekend else "")
 
-    save_state(state)
+            # 날짜 숫자 + 배지
+            badge_html = ""
+            if total > 0:
+                badge_cls = "day-badge" + (" has-pending" if pend_n > 0 and conf_n == 0 else "")
+                badge_html = f'<span class="{badge_cls}">{total}</span>'
+            day_color = "#c0392b" if is_weekend else "#374151"
+            cell = (f'<td class="{td_cls}">'
+                    f'<div class="cal-day-num" style="color:{day_color}">'
+                    f'{d}{badge_html}</div>')
+
+            # 기업 chip
+            for item in sorted(items, key=lambda x: (not x["confirmed"], not x["required"])):
+                name = item["name"]
+                req  = item["required"]
+
+                if item["updated"]:
+                    cls = "chip chip-updated"
+                elif item["confirmed"] and req:
+                    cls = "chip chip-confirmed req"
+                elif item["confirmed"]:
+                    cls = "chip chip-confirmed"
+                elif req:
+                    cls = "chip chip-pending req"
+                else:
+                    cls = "chip chip-pending"
+
+                prefix = "★" if req else ""
+                suffix = "" if item["confirmed"] else " *"
+                title  = name + ("" if item["confirmed"] else " (미정-작년 날짜)")
+                cell += (f'<span class="{cls}" title="{title}">'
+                         f'{prefix}{name}{suffix}</span>')
+
+            cell += "</td>"
+            html.append(cell)
+
+        # 주간 합계 셀
+        if wc + wp > 0:
+            html.append(
+                f'<td class="week-total">'
+                f'<div class="week-cnt">🗓 {wc + wp}</div>'
+                f'<div class="week-sub">확정 {wc}<br>미정 {wp}</div>'
+                f'</td>')
+        else:
+            html.append('<td class="week-total"><span style="color:#ccc">—</span></td>')
+
+        html.append("</tr>")
+
+    html.append("</table></div>")
+    return "\n".join(html)
 
 
 # ─────────────────────────────────────────────
@@ -390,281 +473,243 @@ def apply_company_change(state: dict, old_name: str, new_name: str, original_dat
 
 def render_sidebar(state: dict) -> str:
     st.sidebar.title("⚙️ 설정")
+
     dart_api_key = st.sidebar.text_input(
-        "DART OpenAPI 키 (필수)",
+        "DART OpenAPI 키",
         type="password",
-        help="https://opendart.fss.or.kr 에서 무료 발급. 기업코드 조회에 필요합니다.",
+        help="opendart.fss.or.kr 무료 발급",
     )
 
-    # 기업코드 캐시 상태 표시
     if dart_api_key:
-        if os.path.exists(CORP_CODE_CACHE_PATH):
-            mtime = os.path.getmtime(CORP_CODE_CACHE_PATH)
-            age_h = (time.time() - mtime) / 3600
-            st.sidebar.caption(f"✅ 기업코드 캐시 있음 ({age_h:.0f}시간 전)")
-            if st.sidebar.button("🔄 기업코드 갱신", use_container_width=True):
-                os.remove(CORP_CODE_CACHE_PATH)
-                try:
-                    load_corp_codes(dart_api_key)
-                    st.sidebar.success("기업코드 갱신 완료")
-                except Exception as e:
-                    st.sidebar.error(f"갱신 실패: {e}")
+        if os.path.exists(CORP_CACHE):
+            age_h = (time.time() - os.path.getmtime(CORP_CACHE)) / 3600
+            st.sidebar.caption(f"✅ 기업코드 캐시 ({age_h:.0f}시간 전)")
+            if st.sidebar.button("🔄 기업코드 갱신"):
+                os.remove(CORP_CACHE)
+                with st.spinner("다운로드 중…"):
+                    try:
+                        load_corp_codes(dart_api_key)
+                        st.sidebar.success("완료")
+                    except Exception as e:
+                        st.sidebar.error(str(e))
         else:
-            st.sidebar.caption("⚠️ 기업코드 미다운로드 (첫 검색 시 자동 다운로드)")
+            st.sidebar.caption("⚠️ 첫 검색 시 자동 다운로드")
     else:
-        st.sidebar.warning("API 키를 입력해야 DART 검색이 가능합니다.")
+        st.sidebar.info("API 키 입력 후 DART 검색 가능")
 
     st.sidebar.markdown("---")
 
-    # 전체 DART 검색
-    btn_disabled = not dart_api_key
-    if st.sidebar.button("🔍 전체 기업 DART 검색", use_container_width=True, disabled=btn_disabled):
+    if st.sidebar.button("🔍 전체 DART 검색", use_container_width=True,
+                          disabled=not dart_api_key):
         df = load_excel_data()
-        companies = df["단체명"].tolist()
-
-        # 기업코드 사전 로드
         try:
-            corp_dict = load_corp_codes(dart_api_key)
-            st.sidebar.caption(f"기업코드 DB: {len(corp_dict)}개 상장사")
+            with st.spinner("기업코드 로딩…"):
+                load_corp_codes(dart_api_key)
         except Exception as e:
-            st.sidebar.error(f"기업코드 로드 실패: {e}")
+            st.sidebar.error(str(e))
             return dart_api_key
 
-        progress = st.sidebar.progress(0, text="검색 중...")
+        prog    = st.sidebar.progress(0)
         results = {}
-        for i, corp in enumerate(companies):
-            found_date, source = search_dart_api(corp, dart_api_key)
-            results[corp] = {"date": found_date, "source": source}
-            progress.progress((i + 1) / len(companies), text=f"{corp} 검색 중…")
-            time.sleep(0.5)  # rate limit
-
-        progress.empty()
+        corps   = df["단체명"].tolist()
+        for i, corp in enumerate(corps):
+            found, src = search_dart_api(corp, dart_api_key)
+            results[corp] = {"date": found, "source": src}
+            prog.progress((i + 1) / len(corps), text=f"{corp}…")
+            time.sleep(0.4)
+        prog.empty()
         st.session_state["crawl_results"] = results
 
-        # 새 날짜 자동 적용
-        updated = 0
+        updated_n = 0
         for corp, info in results.items():
             if info["date"]:
-                orig_row = df[df["단체명"] == corp]
-                if not orig_row.empty:
-                    orig_date = orig_row.iloc[0]["주주총회일"]
-                    override_date = state["overrides"].get(corp, orig_date)
-                    if info["date"] != override_date:
+                r = df[df["단체명"] == corp]
+                if not r.empty:
+                    cur = state["overrides"].get(corp, r.iloc[0]["주주총회일"])
+                    if info["date"] != cur:
                         state["overrides"][corp] = info["date"]
                         state.setdefault("updated_recently", set()).add(corp)
                         state.setdefault("updated_timestamps", {})[corp] = datetime.now().isoformat()
-                        updated += 1
+                        updated_n += 1
         save_state(state)
-        if updated:
-            st.sidebar.success(f"✅ {updated}개 기업 날짜 업데이트됨")
-        else:
-            st.sidebar.info("변경된 날짜 없음")
+        msg = f"✅ {updated_n}개 업데이트됨" if updated_n else "변경 없음"
+        st.sidebar.success(msg)
         st.rerun()
 
     st.sidebar.markdown("---")
-    # 업데이트 기록 초기화
+
     if st.sidebar.button("🗑️ 업데이트 표시 초기화", use_container_width=True):
         state["updated_recently"] = set()
         save_state(state)
         st.rerun()
 
-    # 전체 상태 초기화
-    if st.sidebar.button("⚠️ 전체 상태 초기화", use_container_width=True, type="secondary"):
-        if os.path.exists(STATE_PATH):
-            os.remove(STATE_PATH)
-        if os.path.exists(CORP_CODE_CACHE_PATH):
-            os.remove(CORP_CODE_CACHE_PATH)
+    if st.sidebar.button("⚠️ 전체 초기화", use_container_width=True, type="secondary"):
+        for p in [STATE_PATH, CORP_CACHE]:
+            if os.path.exists(p):
+                os.remove(p)
         st.session_state["state"] = load_state()
         st.rerun()
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("""
+**달력 범례**
+
+🟢 초록 칩 = 확정  
+🔵 파란 칩 = 확정 (필수단체)  
+🟡 노란 칩 = DART 업데이트됨  
+🟠 점선 칩 = 미정 (작년 날짜 기준)  
+★ = 필수단체  
+\* = 미정 표시
+""")
 
     return dart_api_key
 
 
 # ─────────────────────────────────────────────
-# 메인 테이블 렌더링
+# 리스트 뷰
 # ─────────────────────────────────────────────
 
-def render_table(df: pd.DataFrame, state: dict, dart_api_key: str):
-    overrides = state["overrides"]
-    changes = state.get("changes", {})
+def render_list_view(df: pd.DataFrame, state: dict, dart_api_key: str):
+    overrides        = state["overrides"]
+    changes          = state.get("changes", {})
     updated_recently = state.get("updated_recently", set())
-    crawl_results = st.session_state.get("crawl_results", {})
+    crawl_results    = st.session_state.get("crawl_results", {})
 
-    # 날짜별로 그룹화
-    def get_display_date(row):
-        return overrides.get(row["단체명"], row["주주총회일"])
+    df = df.copy()
+    df["_disp"] = df.apply(lambda r: overrides.get(r["단체명"], r["주주총회일"]), axis=1)
+    df["_conf"] = df["_disp"].apply(is_confirmed)
 
-    df["_display_date"] = df.apply(get_display_date, axis=1)
-    df["_is_confirmed"] = df["_display_date"].apply(is_confirmed_date)
-
-    confirmed = df[df["_is_confirmed"]].sort_values("_display_date")
-    pending = df[~df["_is_confirmed"]]
-
-    for section_label, section_df in [("📅 주주총회 일자 확정", confirmed), ("⏳ 미정", pending)]:
-        if section_df.empty:
+    for label, sub_df in [
+        ("📅 확정", df[df["_conf"]].sort_values("_disp")),
+        ("⏳ 미정", df[~df["_conf"]]),
+    ]:
+        if sub_df.empty:
             continue
-        st.markdown(f'<div class="section-header">{section_label}</div>', unsafe_allow_html=True)
+        st.markdown(f"### {label}  <span style='font-size:.75em;color:#6b7280'>({len(sub_df)}개)</span>",
+                    unsafe_allow_html=True)
 
-        # 날짜별 그룹
-        if section_label.startswith("📅"):
-            groups = section_df.groupby("_display_date", sort=False)
-            group_items = [(dt, grp) for dt, grp in sorted(groups, key=lambda x: x[0])]
-        else:
-            group_items = [("미정", section_df)]
+        for _, row in sub_df.iterrows():
+            company  = row["단체명"]
+            orig     = row["주주총회일"]
+            disp     = overrides.get(company, orig)
+            required = row["비고"] == "필수단체"
+            updated  = company in updated_recently
+            has_prev = company in changes
 
-        for group_date, group_df in group_items:
-            if section_label.startswith("📅"):
-                st.markdown(
-                    f"**🗓 {group_date}** <span style='color:#9ca3af;font-size:0.85em'>({len(group_df)}개 기업)</span>",
-                    unsafe_allow_html=True
-                )
+            c1, c2, c3, c4 = st.columns([3, 2.5, 1.5, 1.8])
 
-            for _, row in group_df.iterrows():
-                company = row["단체명"]
-                orig_date = row["주주총회일"]
-                display_date = overrides.get(company, orig_date)
-                is_required = row["비고"] == "필수단체"
-                is_updated = company in updated_recently
-                has_prev = company in changes
-
-                # ── 행 컨테이너 ──
-                with st.container():
-                    col_name, col_date, col_dart, col_change = st.columns([3, 2.5, 1.5, 1.5])
-
-                    # 기업명
-                    with col_name:
-                        name_html = company
-                        if is_required:
-                            name_html += ' <span class="required-badge">필수단체</span>'
-                        if has_prev:
-                            prev_key = f"expand_{company}"
-                            is_expanded = company in st.session_state["expanded_prev"]
-                            arrow = "▼" if is_expanded else "▶"
-                            if st.button(
-                                f"{arrow} {company}" + (" ★" if is_required else ""),
-                                key=f"btn_expand_{company}",
-                                help="이전 기업 보기",
-                            ):
-                                if company in st.session_state["expanded_prev"]:
-                                    st.session_state["expanded_prev"].discard(company)
-                                else:
-                                    st.session_state["expanded_prev"].add(company)
-                                st.rerun()
+            with c1:
+                req_sfx = " 🔴" if required else ""
+                upd_html = ' <span class="updated-badge">🔄 업데이트됨</span>' if updated else ""
+                if has_prev:
+                    exp = company in st.session_state["expanded_prev"]
+                    if st.button(f"{'▼' if exp else '▶'} {company}{req_sfx}",
+                                 key=f"exp_{company}"):
+                        if exp:
+                            st.session_state["expanded_prev"].discard(company)
                         else:
-                            st.markdown(name_html, unsafe_allow_html=True)
+                            st.session_state["expanded_prev"].add(company)
+                        st.rerun()
+                else:
+                    st.markdown(
+                        f'<span style="font-weight:600">{company}{req_sfx}</span>{upd_html}',
+                        unsafe_allow_html=True)
 
-                    # 날짜
-                    with col_date:
-                        date_html = render_date(company, orig_date, state)
-                        st.markdown(date_html, unsafe_allow_html=True)
+            with c2:
+                if is_confirmed(disp):
+                    st.markdown(f'<span class="date-conf">{disp}</span>', unsafe_allow_html=True)
+                else:
+                    est = extract_pending_date(orig)
+                    est_txt = f" → 예상 {est}" if est else ""
+                    st.markdown(f'<span class="date-pend">{disp}{est_txt}</span>',
+                                unsafe_allow_html=True)
 
-                    # DART 검색 (개별)
-                    with col_dart:
-                        if st.button("🔍 DART", key=f"dart_{company}",
-                                     help="DART에서 날짜 검색 (API 키 필요)",
-                                     disabled=not dart_api_key):
-                            with st.spinner(f"{company} 검색 중…"):
-                                found, src = search_dart_api(company, dart_api_key)
-                                crawl_results[company] = {"date": found, "source": src}
-                                st.session_state["crawl_results"] = crawl_results
-
-                                if found and found != display_date:
-                                    state["overrides"][company] = found
-                                    state.setdefault("updated_recently", set()).add(company)
-                                    state.setdefault("updated_timestamps", {})[company] = datetime.now().isoformat()
-                                    save_state(state)
-                                    st.rerun()
-
-                        # 검색 결과 표시
-                        if company in crawl_results:
-                            res = crawl_results[company]
-                            if res["date"] and res["date"] != display_date:
-                                st.markdown(f'<span class="crawl-new">→ {res["date"]}</span>', unsafe_allow_html=True)
-                            elif res["date"]:
-                                st.markdown(f'<span class="crawl-same">✓ 동일</span>', unsafe_allow_html=True)
-                            else:
-                                st.caption(res["source"])
-
-                    # 기업 변경 버튼
-                    with col_change:
-                        if st.button("✏️ 기업변경", key=f"change_{company}", help="기업명 변경"):
-                            st.session_state["change_modal"] = {
-                                "old_name": company,
-                                "orig_date": orig_date,
-                            }
+            with c3:
+                if st.button("🔍 DART", key=f"dart_{company}",
+                             disabled=not dart_api_key):
+                    with st.spinner(f"{company}…"):
+                        found, src = search_dart_api(company, dart_api_key)
+                        crawl_results[company] = {"date": found, "source": src}
+                        st.session_state["crawl_results"] = crawl_results
+                        if found and found != disp:
+                            state["overrides"][company] = found
+                            state.setdefault("updated_recently", set()).add(company)
+                            state.setdefault("updated_timestamps", {})[company] = datetime.now().isoformat()
+                            save_state(state)
                             st.rerun()
 
-                # 이전 기업 펼침
-                if has_prev and company in st.session_state["expanded_prev"]:
-                    prev = changes[company]
-                    st.markdown(
-                        f"""<div class="prev-company-block">
-                        🔁 <strong>변경 1회 전 기업</strong>: {prev['prev_name']}
-                        &nbsp;|&nbsp; 날짜: {prev['prev_date']}
-                        &nbsp;|&nbsp; 변경일시: {prev['changed_at']}
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
+                if company in crawl_results:
+                    res = crawl_results[company]
+                    if res["date"] and res["date"] != disp:
+                        st.markdown(f'<span class="dart-ok">→ {res["date"]}</span>',
+                                    unsafe_allow_html=True)
+                    elif res["date"]:
+                        st.markdown('<span class="dart-same">✓ 동일</span>',
+                                    unsafe_allow_html=True)
+                    else:
+                        st.markdown(f'<span class="dart-err">✗ {res["source"]}</span>',
+                                    unsafe_allow_html=True)
 
-        st.markdown("<br>", unsafe_allow_html=True)
+            with c4:
+                if st.button("✏️ 기업변경", key=f"chg_{company}"):
+                    st.session_state["change_modal"] = {
+                        "old_name": company, "orig_date": orig}
+                    st.rerun()
+
+            if has_prev and company in st.session_state["expanded_prev"]:
+                prev = changes[company]
+                st.markdown(
+                    f'<div style="background:#f1f5f9;border-left:4px solid #94a3b8;'
+                    f'border-radius:0 6px 6px 0;padding:7px 14px;margin:3px 0 8px 0;'
+                    f'font-size:.85em;color:#475569;">'
+                    f'🔁 <strong>변경 1회 전</strong>: {prev["prev_name"]} '
+                    f'| 날짜: {prev["prev_date"]} '
+                    f'| {prev["changed_at"]}</div>',
+                    unsafe_allow_html=True)
+
+        st.markdown("")
 
 
 # ─────────────────────────────────────────────
 # 기업 변경 모달
 # ─────────────────────────────────────────────
 
-def render_change_modal(df: pd.DataFrame, state: dict):
-    modal_info = st.session_state.get("change_modal")
-    if not modal_info:
+def render_change_modal(state: dict):
+    info = st.session_state.get("change_modal")
+    if not info:
         return
 
-    old_name = modal_info["old_name"]
-    orig_date = modal_info["orig_date"]
+    old_name  = info["old_name"]
+    orig_date = info["orig_date"]
 
     with st.expander(f"✏️ 기업 변경: {old_name}", expanded=True):
-        st.info(
-            f"**{old_name}** 를 다른 기업으로 변경합니다.\n\n"
-            "기존 기업은 **변경 1회 전 기업**으로 분류되어 기업명 클릭 시 확인할 수 있습니다."
-        )
-        new_name = st.text_input(
-            "새 기업명을 입력하세요",
-            placeholder="예: 삼성SDI",
-            key="new_company_input",
-        )
+        st.info(f"**{old_name}** 을 다른 기업으로 교체합니다.\n\n기존 기업은 '변경 1회 전 기업'으로 기록됩니다.")
+        new_name = st.text_input("새 기업명", placeholder="예: 삼성SDI", key="nci")
+        opt = st.radio("새 기업 주주총회 날짜", ["직접 입력", "미정"], horizontal=True, key="ndo")
+        new_date = "미정"
+        if opt == "직접 입력":
+            new_date = st.date_input("날짜 선택", key="ndi").strftime("%Y-%m-%d")
 
-        # 새 기업의 날짜 선택
-        new_date_option = st.radio(
-            "새 기업의 주주총회 날짜",
-            ["직접 입력", "미정으로 설정"],
-            horizontal=True,
-            key="new_date_option",
-        )
-        new_date_str = ""
-        if new_date_option == "직접 입력":
-            new_date_input = st.date_input("날짜 선택", key="new_date_input")
-            new_date_str = new_date_input.strftime("%Y-%m-%d")
-        else:
-            new_date_str = "미정"
-
-        col_ok, col_cancel = st.columns(2)
-        with col_ok:
-            if st.button("✅ 변경 확정", type="primary", use_container_width=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("✅ 확정", type="primary", use_container_width=True):
                 if new_name.strip():
-                    # df에 새 기업 행 추가 (캐시 무효화)
-                    apply_company_change(state, old_name, new_name.strip(), orig_date)
-                    # 새 기업의 날짜 override 설정
-                    state["overrides"][new_name.strip()] = new_date_str
-                    # 원래 기업 행을 새 기업으로 교체하기 위해 별도 매핑 저장
-                    state.setdefault("name_replacements", {})[old_name] = new_name.strip()
+                    nn = new_name.strip()
+                    state.setdefault("changes", {})[nn] = {
+                        "prev_name": old_name,
+                        "prev_date": state["overrides"].get(old_name, orig_date),
+                        "changed_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    }
+                    state["overrides"].pop(old_name, None)
+                    state["overrides"][nn] = new_date
+                    state.setdefault("name_replacements", {})[old_name] = nn
                     save_state(state)
                     load_excel_data.clear()
                     st.session_state["change_modal"] = None
-                    st.success(f"✅ {old_name} → {new_name.strip()} 로 변경되었습니다.")
                     st.rerun()
                 else:
-                    st.error("기업명을 입력해주세요.")
-
-        with col_cancel:
+                    st.error("기업명을 입력하세요.")
+        with c2:
             if st.button("❌ 취소", use_container_width=True):
                 st.session_state["change_modal"] = None
                 st.rerun()
@@ -677,64 +722,73 @@ def render_change_modal(df: pd.DataFrame, state: dict):
 def main():
     init_session()
     state = st.session_state["state"]
-
-    # 사이드바
     dart_api_key = render_sidebar(state)
 
     # 헤더
-    st.title("📋 주주총회 일정 트래커")
-    last_updated = max(state.get("updated_timestamps", {}).values(), default=None)
-    if last_updated:
-        st.caption(f"마지막 업데이트: {last_updated[:16]}")
+    col_t, col_v = st.columns([5, 2])
+    with col_t:
+        st.title("📅 주주총회 일정 트래커")
+        ts = max(state.get("updated_timestamps", {}).values(), default=None)
+        if ts:
+            st.caption(f"마지막 DART 업데이트: {ts[:16]}")
+    with col_v:
+        st.markdown("<br>", unsafe_allow_html=True)
+        view = st.radio("보기 모드", ["📅 달력", "📋 리스트"],
+                        horizontal=True, key="view_radio")
 
-    # 모달 먼저 (위에 표시)
-    render_change_modal(None, state)
+    render_change_modal(state)
 
-    # 엑셀 로드
+    # 데이터 로드
     try:
         df = load_excel_data()
     except FileNotFoundError:
-        st.error(f"'{EXCEL_PATH}' 파일을 찾을 수 없습니다. 앱과 같은 폴더에 파일을 놓아주세요.")
+        st.error(f"'{EXCEL_PATH}' 파일을 app.py 와 같은 폴더에 넣어주세요.")
         return
 
-    # 기업명 교체 적용
-    name_replacements = state.get("name_replacements", {})
-    if name_replacements:
-        df["단체명"] = df["단체명"].replace(name_replacements)
-        # 이미 존재하는 기업명이면 중복 제거
+    # 기업명 교체
+    repl = state.get("name_replacements", {})
+    if repl:
+        df["단체명"] = df["단체명"].replace(repl)
         df = df.drop_duplicates(subset=["단체명"]).reset_index(drop=True)
 
-    # 헤더 행
-    h1, h2, h3, h4 = st.columns([3, 2.5, 1.5, 1.5])
-    h1.markdown("**기업명**")
-    h2.markdown("**주주총회일**")
-    h3.markdown("**DART 검색**")
-    h4.markdown("**기업 변경**")
-    st.divider()
+    if "달력" in view:
+        # 통계
+        overrides = state["overrides"]
+        conf_n = sum(1 for _, r in df.iterrows()
+                     if is_confirmed(overrides.get(r["단체명"], r["주주총회일"])))
+        pend_n = len(df) - conf_n
+        upd_n  = len(state.get("updated_recently", set()))
 
-    # 테이블 렌더링
-    render_table(df, state, dart_api_key)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("전체 기업", len(df))
+        m2.metric("📅 확정", conf_n, delta=f"+{upd_n} 업데이트" if upd_n else None)
+        m3.metric("⏳ 미정", pend_n)
+        m4.metric("🔴 필수단체", int((df["비고"] == "필수단체").sum()))
+        st.markdown("---")
 
-    # 범례
-    with st.expander("ℹ️ 범례 / 사용법"):
-        st.markdown("""
-        | 색상/표시 | 의미 |
-        |---|---|
-        | 🟢 초록색 날짜 | 주주총회 일자 확정 |
-        | 🟡 이탤릭 날짜 | 미정 (예상일) |
-        | 🟡 `업데이트됨` 배지 | DART 검색으로 날짜가 변경된 기업 |
-        | 🔴 `필수단체` 배지 | 필수 의결권 행사 대상 |
-        | ▶ 기업명 버튼 | 이전 기업 정보 펼치기/닫기 |
+        day_map = build_day_map(df, state)
 
-        **DART 검색 방법:**
-        - 개별: 각 기업의 🔍 DART 버튼 클릭
-        - 전체: 사이드바 > 🔍 전체 기업 DART 검색
-        - DART OpenAPI 키 입력 시 더 정확한 결과 제공
+        # 달력 월 범위 계산
+        all_keys = list(day_map.keys())
+        if all_keys:
+            sy, sm = int(min(all_keys)[:4]), int(min(all_keys)[5:7])
+            ey, em = int(max(all_keys)[:4]), int(max(all_keys)[5:7])
+        else:
+            now = datetime.now()
+            sy, sm, ey, em = now.year, now.month, now.year, now.month
 
-        **기업 변경:**
-        - ✏️ 기업변경 버튼 → 새 기업명 입력 → 확정
-        - 기존 기업은 새 기업명 클릭 시 '변경 1회 전 기업'으로 확인 가능
-        """)
+        y, m = sy, sm
+        while (y, m) <= (ey, em):
+            st.subheader(f"{y}년 {m}월")
+            st.markdown(render_calendar_html(y, m, day_map),
+                        unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
+            m += 1
+            if m > 12:
+                m, y = 1, y + 1
+
+    else:
+        render_list_view(df, state, dart_api_key)
 
 
 if __name__ == "__main__":
