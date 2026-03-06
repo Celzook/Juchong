@@ -332,18 +332,17 @@ def search_dart_api(company_name: str, api_key: str) -> tuple[str | None, str]:
         if not rcept_no:
             return None, f"주주총회 공시 없음 (corp_code: {corp_code})"
 
-        # document.xml 파싱
+        # document.xml에서 실제 주주총회 개최일 파싱
         agm_date = parse_agm_date_from_xml(api_key, rcept_no)
-        if agm_date:
-            return agm_date, f"DART XML ({report_nm})"
 
-        # fallback: 접수일
-        m = re.match(r"(\d{4})(\d{2})(\d{2})", rcept_dt)
-        if m:
-            return (f"{m.group(1)}-{m.group(2)}-{m.group(3)}",
-                    f"DART 접수일 기준 ({report_nm})")
+        if not agm_date:
+            return None, f"공시 본문 날짜 파싱 실패 ({report_nm})"
 
-        return None, "날짜 파싱 실패"
+        # 2026년 3월인지 검증 — 이외 값은 파싱 오류로 처리
+        if not agm_date.startswith("2026-03-"):
+            return None, f"날짜 오류: {agm_date} (2026년 3월 아님)"
+
+        return agm_date, f"DART XML ({report_nm})"
 
     except requests.exceptions.ConnectionError:
         return None, "네트워크 오류"
@@ -768,24 +767,10 @@ def main():
 
         day_map = build_day_map(df, state)
 
-        # 달력 월 범위 계산
-        all_keys = list(day_map.keys())
-        if all_keys:
-            sy, sm = int(min(all_keys)[:4]), int(min(all_keys)[5:7])
-            ey, em = int(max(all_keys)[:4]), int(max(all_keys)[5:7])
-        else:
-            now = datetime.now()
-            sy, sm, ey, em = now.year, now.month, now.year, now.month
-
-        y, m = sy, sm
-        while (y, m) <= (ey, em):
-            st.subheader(f"{y}년 {m}월")
-            st.markdown(render_calendar_html(y, m, day_map),
-                        unsafe_allow_html=True)
-            st.markdown("<br>", unsafe_allow_html=True)
-            m += 1
-            if m > 12:
-                m, y = 1, y + 1
+        # 3월 달력 고정
+        st.subheader("2026년 3월")
+        st.markdown(render_calendar_html(2026, 3, day_map),
+                    unsafe_allow_html=True)
 
     else:
         render_list_view(df, state, dart_api_key)
