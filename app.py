@@ -4,6 +4,9 @@ import json
 import os
 import re
 import time
+import zipfile
+import io
+import xml.etree.ElementTree as ET
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, date
@@ -163,92 +166,181 @@ def init_session():
 
 
 # ─────────────────────────────────────────────
-# DART 크롤링
+# DART OpenAPI
 # ─────────────────────────────────────────────
 
-def search_dart(company_name: str) -> tuple[str | None, str]:
-    """
-    DART 공시 검색으로 주주총회 날짜 탐색.
-    Returns (date_str | None, source_str)
-    """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "ko-KR,ko;q=0.9",
-        "Referer": "https://dart.fss.or.kr/",
-    }
-    year = datetime.now().year
-    try:
-        url = "https://dart.fss.or.kr/dsab002/main.do"
-        params = {
-            "selectKey": company_name,
-            "currentPage": "1",
-            "maxResults": "15",
-            "sort": "date",
-            "series": "desc",
-            "textCrpNm": company_name,
-            "startDt": f"{year}0101",
-            "endDt": f"{year}1231",
-            "reportNamepR": "주주총회",
-        }
-        resp = requests.get(url, params=params, headers=headers, timeout=12)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+CORP_CODE_CACHE_PATH = "dart_corp_codes.json"
 
-        # 공시 목록에서 날짜 파싱 시도
-        rows = soup.select("table.tbList tbody tr")
-        for row in rows:
-            cells = row.find_all("td")
-            if len(cells) >= 5:
-                title = cells[2].get_text(strip=True)
-                rcept_dt = cells[4].get_text(strip=True)  # 접수일
-                # 주주총회 소집 공고 / 주주총회 결과
-                if "주주총회" in title:
-                    # 날짜 형식: YYYY.MM.DD
-                    m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})", rcept_dt)
-                    if m:
-                        d = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-                        return d, f"DART ({title})"
-        return None, "DART: 공시 없음"
-    except requests.exceptions.ConnectionError:
-        return None, "네트워크 오류"
-    except Exception as e:
-        return None, f"오류: {e}"
+def load_corp_codes(api_key: str) -> dict:
+    """
+    DART 전체 기업코드 목록을 다운로드하여 {기업명: corp_code} 딕셔너리 반환.
+    로컬 캐시(dart_corp_codes.json) 있으면 재사용.
+    """
+    # 캐시 확인 (하루 이내)
+    if os.path.exists(CORP_CODE_CACHE_PATH):
+        mtime = os.path.getmtime(CORP_CODE_CACHE_PATH)
+        if time.time() - mtime < 86400:  # 24시간
+            with open(CORP_CODE_CACHE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+
+    url = f"https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key={api_key}"
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+
+    # ZIP 압축 해제 후 XML 파싱
+    zf = zipfile.ZipFile(io.BytesIO(resp.content))
+    xml_data = zf.read("CORPCODE.xml")
+    root = ET.fromstring(xml_data)
+
+    corp_dict = {}
+    for item in root.findall("list"):
+        corp_name = item.findtext("corp_name", "").strip()
+        corp_code = item.findtext("corp_code", "").strip()
+        stock_code = item.findtext("stock_code", "").strip()
+        if corp_name and corp_code and stock_code:  # 상장사만
+            corp_dict[corp_name] = corp_code
+
+    # 캐시 저장
+    with open(CORP_CODE_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(corp_dict, f, ensure_ascii=False)
+
+    return corp_dict
+
+
+def find_corp_code(corp_dict: dict, company_name: str) -> str | None:
+    """
+    정확 매칭 → 부분 매칭 순으로 corp_code 탐색.
+    예: 'NAVER' → 'NAVER' 정확 매칭, '현대모비스' → 정확 매칭
+    """
+    # 1) 정확 매칭
+    if company_name in corp_dict:
+        return corp_dict[company_name]
+
+    # 2) 대소문자 무시 정확 매칭
+    lower_name = company_name.lower()
+    for k, v in corp_dict.items():
+        if k.lower() == lower_name:
+            return v
+
+    # 3) 부분 문자열 매칭 (입력값이 사전 키에 포함)
+    candidates = [(k, v) for k, v in corp_dict.items() if company_name in k or k in company_name]
+    if len(candidates) == 1:
+        return candidates[0][1]
+    if len(candidates) > 1:
+        # 길이가 가장 가까운 것 선택
+        candidates.sort(key=lambda x: abs(len(x[0]) - len(company_name)))
+        return candidates[0][1]
+
+    return None
+
+
+def parse_agm_date_from_doc(api_key: str, rcept_no: str) -> str | None:
+    """
+    공시 문서 본문에서 실제 주주총회 개최 일시를 파싱.
+    Returns 'YYYY-MM-DD' or None
+    """
+    try:
+        # 문서 목록 조회
+        doc_list_url = "https://opendart.fss.or.kr/api/document.json"
+        r = requests.get(doc_list_url, params={"crtfc_key": api_key, "rcept_no": rcept_no}, timeout=10)
+        docs = r.json()
+        if docs.get("status") != "000":
+            return None
+
+        # 첫 번째 문서 HTML 가져오기
+        for doc in docs.get("list", [])[:3]:
+            dcm_no = doc.get("dcm_no")
+            if not dcm_no:
+                continue
+            viewer_url = f"https://dart.fss.or.kr/report/viewer.do?rcpNo={rcept_no}&dcmNo={dcm_no}&eleId=0&offset=0&length=0&dtd=dart3.xsd"
+            rv = requests.get(viewer_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            soup = BeautifulSoup(rv.text, "html.parser")
+            text = soup.get_text(" ", strip=True)
+
+            # "주주총회 일시" 또는 "개최일시" 등 패턴 탐색
+            patterns = [
+                r"(?:주주총회\s*일시|개최일시|회의일시)[^\d]*(\d{4})[년.\s-]+(\d{1,2})[월.\s-]+(\d{1,2})",
+                r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일.*?(?:주주총회|정기총회)",
+            ]
+            for pat in patterns:
+                m = re.search(pat, text)
+                if m:
+                    y, mo, d = m.group(1), m.group(2).zfill(2), m.group(3).zfill(2)
+                    return f"{y}-{mo}-{d}"
+    except Exception:
+        pass
+    return None
 
 
 def search_dart_api(company_name: str, api_key: str) -> tuple[str | None, str]:
     """
-    DART OpenAPI 사용 (api_key 필요).
+    DART OpenAPI로 주주총회 날짜 탐색.
+    1단계: 기업명 → corp_code 변환
+    2단계: corp_code로 주주총회소집공고(G003) 공시 목록 조회
+    3단계: 공시 본문에서 실제 주주총회 개최일 파싱
     Returns (date_str | None, source_str)
     """
     if not api_key:
         return None, "API 키 없음"
+
     year = datetime.now().year
+
     try:
-        url = "https://opendart.fss.or.kr/api/list.json"
+        # ── 1단계: corp_code 조회 ──
+        with st.spinner(f"기업코드 조회 중…"):
+            corp_dict = load_corp_codes(api_key)
+
+        corp_code = find_corp_code(corp_dict, company_name)
+        if not corp_code:
+            return None, f"기업코드 없음 ('{company_name}' 미매칭)"
+
+        # ── 2단계: 공시 목록 조회 ──
+        list_url = "https://opendart.fss.or.kr/api/list.json"
         params = {
             "crtfc_key": api_key,
-            "corp_name": company_name,
+            "corp_code": corp_code,          # ← corp_code 사용 (핵심 수정)
             "bgn_de": f"{year}0101",
             "end_de": f"{year}1231",
-            "pblntf_detail_ty": "G003",
+            "pblntf_detail_ty": "G003",      # 주주총회소집공고
             "page_count": 10,
         }
-        resp = requests.get(url, params=params, timeout=12)
+        resp = requests.get(list_url, params=params, timeout=12)
         data = resp.json()
-        if data.get("status") == "000" and data.get("list"):
-            item = data["list"][0]
-            dt_raw = item.get("rcept_dt", "")
-            m = re.match(r"(\d{4})(\d{2})(\d{2})", dt_raw)
-            if m:
-                d = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-                return d, f"DART API ({item.get('report_nm','')})"
-        return None, "DART API: 공시 없음"
+
+        if data.get("status") != "000" or not data.get("list"):
+            # G003 없으면 G004(주주총회결과)도 시도
+            params["pblntf_detail_ty"] = "G004"
+            resp2 = requests.get(list_url, params=params, timeout=12)
+            data2 = resp2.json()
+            if data2.get("status") != "000" or not data2.get("list"):
+                return None, f"공시 없음 (corp_code: {corp_code})"
+            data = data2
+
+        filing = data["list"][0]
+        rcept_no = filing.get("rcept_no", "")
+        report_nm = filing.get("report_nm", "")
+        rcept_dt_raw = filing.get("rcept_dt", "")
+
+        # ── 3단계: 문서 본문에서 실제 주주총회 날짜 파싱 ──
+        agm_date = None
+        if rcept_no:
+            agm_date = parse_agm_date_from_doc(api_key, rcept_no)
+
+        if agm_date:
+            return agm_date, f"DART ({report_nm}, 본문 파싱)"
+
+        # 본문 파싱 실패 시 접수일로 fallback
+        m = re.match(r"(\d{4})(\d{2})(\d{2})", rcept_dt_raw)
+        if m:
+            fallback_date = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+            return fallback_date, f"DART ({report_nm}, 접수일 기준)"
+
+        return None, "날짜 파싱 실패"
+
+    except requests.exceptions.ConnectionError:
+        return None, "네트워크 오류"
     except Exception as e:
-        return None, f"API 오류: {e}"
+        return None, f"API 오류: {str(e)}"
 
 
 # ─────────────────────────────────────────────
@@ -299,27 +391,52 @@ def apply_company_change(state: dict, old_name: str, new_name: str, original_dat
 def render_sidebar(state: dict) -> str:
     st.sidebar.title("⚙️ 설정")
     dart_api_key = st.sidebar.text_input(
-        "DART OpenAPI 키 (선택)",
+        "DART OpenAPI 키 (필수)",
         type="password",
-        help="https://opendart.fss.or.kr 에서 발급. 없으면 웹 크롤링 사용.",
+        help="https://opendart.fss.or.kr 에서 무료 발급. 기업코드 조회에 필요합니다.",
     )
+
+    # 기업코드 캐시 상태 표시
+    if dart_api_key:
+        if os.path.exists(CORP_CODE_CACHE_PATH):
+            mtime = os.path.getmtime(CORP_CODE_CACHE_PATH)
+            age_h = (time.time() - mtime) / 3600
+            st.sidebar.caption(f"✅ 기업코드 캐시 있음 ({age_h:.0f}시간 전)")
+            if st.sidebar.button("🔄 기업코드 갱신", use_container_width=True):
+                os.remove(CORP_CODE_CACHE_PATH)
+                try:
+                    load_corp_codes(dart_api_key)
+                    st.sidebar.success("기업코드 갱신 완료")
+                except Exception as e:
+                    st.sidebar.error(f"갱신 실패: {e}")
+        else:
+            st.sidebar.caption("⚠️ 기업코드 미다운로드 (첫 검색 시 자동 다운로드)")
+    else:
+        st.sidebar.warning("API 키를 입력해야 DART 검색이 가능합니다.")
+
     st.sidebar.markdown("---")
 
     # 전체 DART 검색
-    if st.sidebar.button("🔍 전체 기업 DART 검색", use_container_width=True):
+    btn_disabled = not dart_api_key
+    if st.sidebar.button("🔍 전체 기업 DART 검색", use_container_width=True, disabled=btn_disabled):
         df = load_excel_data()
         companies = df["단체명"].tolist()
+
+        # 기업코드 사전 로드
+        try:
+            corp_dict = load_corp_codes(dart_api_key)
+            st.sidebar.caption(f"기업코드 DB: {len(corp_dict)}개 상장사")
+        except Exception as e:
+            st.sidebar.error(f"기업코드 로드 실패: {e}")
+            return dart_api_key
+
         progress = st.sidebar.progress(0, text="검색 중...")
         results = {}
         for i, corp in enumerate(companies):
-            if dart_api_key:
-                found_date, source = search_dart_api(corp, dart_api_key)
-            else:
-                found_date, source = search_dart(corp)
-
+            found_date, source = search_dart_api(corp, dart_api_key)
             results[corp] = {"date": found_date, "source": source}
             progress.progress((i + 1) / len(companies), text=f"{corp} 검색 중…")
-            time.sleep(0.3)  # rate limit
+            time.sleep(0.5)  # rate limit
 
         progress.empty()
         st.session_state["crawl_results"] = results
@@ -355,6 +472,8 @@ def render_sidebar(state: dict) -> str:
     if st.sidebar.button("⚠️ 전체 상태 초기화", use_container_width=True, type="secondary"):
         if os.path.exists(STATE_PATH):
             os.remove(STATE_PATH)
+        if os.path.exists(CORP_CODE_CACHE_PATH):
+            os.remove(CORP_CODE_CACHE_PATH)
         st.session_state["state"] = load_state()
         st.rerun()
 
@@ -441,12 +560,11 @@ def render_table(df: pd.DataFrame, state: dict, dart_api_key: str):
 
                     # DART 검색 (개별)
                     with col_dart:
-                        if st.button("🔍 DART", key=f"dart_{company}", help="DART에서 날짜 검색"):
+                        if st.button("🔍 DART", key=f"dart_{company}",
+                                     help="DART에서 날짜 검색 (API 키 필요)",
+                                     disabled=not dart_api_key):
                             with st.spinner(f"{company} 검색 중…"):
-                                if dart_api_key:
-                                    found, src = search_dart_api(company, dart_api_key)
-                                else:
-                                    found, src = search_dart(company)
+                                found, src = search_dart_api(company, dart_api_key)
                                 crawl_results[company] = {"date": found, "source": src}
                                 st.session_state["crawl_results"] = crawl_results
 
