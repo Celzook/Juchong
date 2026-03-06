@@ -425,33 +425,24 @@ def search_kvote(company_name: str) -> tuple[str | None, str]:
 # ─────────────────────────────────────────────
 
 def search_agm_date(company_name: str, api_key: str) -> tuple[str | None, str, dict]:
-    """
-    DART + K-Vote 동시 조회 후 교차검증.
-    Returns: (확정날짜 | None, 상태메시지, 상세결과dict)
-    """
     detail = {"dart": (None, ""), "kvote": (None, "")}
 
     # DART 조회
     dart_date, dart_src = search_dart_api(company_name, api_key) if api_key else (None, "API 키 없음")
     detail["dart"] = (dart_date, dart_src)
 
-    # K-Vote 조회 (API 키 불필요)
-    kvote_date, kvote_src = search_kvote(company_name)
-    detail["kvote"] = (kvote_date, kvote_src)
+    # K-Vote 주석 처리 (현재 불안정 + 대기열 문제)
+    # kvote_date, kvote_src = search_kvote(company_name)
+    kvote_date, kvote_src = None, "K-Vote 스킵 (접속 대기열 / 과부하)"
+    detail["kvote"] = (None, kvote_src)
 
-    dart_ok  = validate_march_2026(dart_date)
+    dart_ok = validate_march_2026(dart_date)
     kvote_ok = validate_march_2026(kvote_date)
 
-    # ── 교차검증 판정 ──
-    if dart_ok and kvote_ok:
-        if dart_date == kvote_date:
-            return dart_date, f"✅ 교차확인 (DART·K-Vote 일치: {dart_date})", detail
-        else:
-            # 불일치 → 둘 다 표시하되 DART 우선
-            return dart_date, f"⚠️ 불일치 DART={dart_date} / K-Vote={kvote_date}", detail
-
+    # 교차검증 판정 (K-Vote 없으므로 DART 우선)
     if dart_ok:
-        return dart_date, f"🟡 DART 단독확인 (K-Vote 미조회)", detail
+        return dart_date, f"🟢 DART 확인 ({dart_src}) - K-Vote 스킵", detail
+    # ... (나머지 그대로, msgs에 K-Vote 스킵 메시지 추가)
 
     if kvote_ok:
         return kvote_date, f"🟡 K-Vote 단독확인 (DART 공시 미등록)", detail
