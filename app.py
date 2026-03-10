@@ -175,8 +175,8 @@ def search_dart_api(company_name: str, api_key: str):
 
         dart = OpenDartReader(api_key)
         year = datetime.now().year
-        reports = dart.list(corp_code, start=f"{year}-01-01", end=f"{year}-03-31",
-                            kind="A")  # kind="A": 정기공시
+        # kind 지정 없이 전체 공시 조회 — 주주총회소집결의는 A(정기) 아닌 경우도 있음
+        reports = dart.list(corp_code, start=f"{year}-01-01", end=f"{year}-03-31")
 
         if not isinstance(reports, pd.DataFrame) or reports.empty:
             return None, "공시 없음"
@@ -205,9 +205,6 @@ def search_dart_api(company_name: str, api_key: str):
         return None, "네트워크 오류"
     except Exception as e:
         return None, f"오류: {str(e)[:50]}"
-
-    except requests.exceptions.ConnectionError:
-        return None, "네트워크 오류"
     except Exception as e:
         return None, f"오류: {str(e)[:40]}"
 
