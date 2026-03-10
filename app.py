@@ -234,59 +234,58 @@ def find_corp_code(corp_dict: dict, name: str) -> str | None:
 
 
 def parse_agm_date_from_xml(api_key: str, rcept_no: str) -> str | None:
-    """강화된 정규식 + '일시' 키워드 우선으로 주주총회 확정일 추출"""
+    """
+    강화된 정규식으로 주주총회 확정일 추출.
+    태그 기반 파싱 제거, 원문 텍스트 전체에 넓은 패턴 적용.
+    """
     try:
         resp = requests.get(
             "https://opendart.fss.or.kr/api/document.xml",
-            params={"crtfc_key": api_key, "rcept_no": rcept_no.replace("-", "")},
-            timeout=25
-        )
+            params={"crtfc_key": api_key,
+                    "rcept_no": rcept_no.replace("-", "")},
+            timeout=20)
         resp.raise_for_status()
+
         zf = zipfile.ZipFile(io.BytesIO(resp.content))
         xml_names = [f for f in zf.namelist() if f.lower().endswith(".xml")]
         if not xml_names:
             return None
+
         raw = zf.read(xml_names[0]).decode("utf-8", errors="ignore")
 
-        # 디버깅용 (필요시 주석 해제)
-        # print(raw[:4000])  # 처음 4000자 출력해서 어디서 날짜 나오는지 확인
-
-        # 0순위: 가장 흔한 패턴 "일시 : 2026년 3월 24일" (셀트리온 등)
-        p0 = re.compile(
-            r"(?:일시|개최일시|총회일시|주주총회\s*일시|소집일시)[:\s]*"
-            r"(\d{4})[년.\s\-]*(\d{1,2})[월.\s\-]*(\d{1,2})",
-            re.IGNORECASE
-        )
-
-        # 당신 기존 패턴들 (이미 좋음)
+        # 패턴1: "주주총회/정기총회/개최일 ... 2026년 3월 19일" (코나아이 등 실제 문구)
         p1 = re.compile(
             r"(?:주주총회|정기총회|소집일|개최일|총회일)[^0-9]{0,30}?"
             r"(\d{4})[년.\s\-]*(\d{1,2})[월.\s\-]*(\d{1,2})",
             re.IGNORECASE
         )
+        # 패턴2: "2026. 3. 19." 뒤에 총회/소집/개최
         p2 = re.compile(
             r"(\d{4})[.\-년\s]+(\d{1,2})[.\-월\s]+(\d{1,2})"
             r"[^0-9]{0,30}(?:주주총회|정기총회|소집|개최)",
             re.IGNORECASE
         )
-        p3 = re.compile(r"\b(2026)[.\-](0?[1-9]|1[0-2])[.\-](0?[1-9]|[12]\d|3[01])\b")
+        # 패턴3: "2026.03.19" / "2026-03-19" 순수 날짜
+        p3 = re.compile(
+            r"\b(2026)[.\-](0?[1-9]|1[0-2])[.\-](0?[1-9]|[12]\d|3[01])\b"
+        )
 
-        for pat in [p0, p1, p2, p3]:  # p0을 맨 앞에 → '일시' 우선
+        for pat in [p1, p2, p3]:
             for m in pat.finditer(raw):
                 y, mo, d = m.group(1), m.group(2), m.group(3)
                 date_str = f"{y}-{int(mo):02d}-{int(d):02d}"
                 if validate_march_2026(date_str):
                     return date_str
 
-        # 최후 수단 (당신 거 유지)
+        # 최후 수단: "2026" + "3" + 일자가 근접한 경우
         m = re.search(r"2026[.\s\-년]*0?3[.\s\-월]*([0-2]?\d|3[01])[.\s일]*", raw)
         if m:
             candidate = f"2026-03-{int(m.group(1)):02d}"
             if validate_march_2026(candidate):
                 return candidate
 
-    except Exception as e:
-        print(f"parse_agm_date 오류: {e}")  # 디버깅용
+    except Exception:
+        pass
     return None
 
 
@@ -332,35 +331,33 @@ def search_dart_api(company_name: str, api_key: str) -> tuple[str | None, str]:
 
         items = data.get("list", [])
 
-        # 1순위: 소집결의 (정정 포함)
+        # 1순위: 소집결의
+        rcept_no = report_nm = rcept_dt = ""
         for item in items:
-            report_nm = item.get("report_nm", "")
-            if "주주총회소집결의" in report_nm or "[기재정정]주주총회소집결의" in report_nm:
-                rcept_no = item["rcept_no"]
-                report_nm_full = report_nm
-                rcept_dt = item.get("rcept_dt", "")  # 참고용
+            if "주주총회소집결의" in item.get("report_nm", ""):
+                rcept_no  = item["rcept_no"]
+                report_nm = item["report_nm"]
+                rcept_dt  = item.get("rcept_dt", "")
                 break
 
         # 2순위: 소집공고
         if not rcept_no:
             for item in items:
-                report_nm = item.get("report_nm", "")
-                if "주주총회소집공고" in report_nm:
-                    rcept_no = item["rcept_no"]
-                    report_nm_full = report_nm
-                    rcept_dt = item.get("rcept_dt", "")
+                if "주주총회소집공고" in item.get("report_nm", ""):
+                    rcept_no  = item["rcept_no"]
+                    report_nm = item["report_nm"]
+                    rcept_dt  = item.get("rcept_dt", "")
                     break
-    
-        # 3순위: 주주총회 관련 모든 공시
+
+        # 3순위: 주주총회/정기총회/소집 포함 모든 공시
         if not rcept_no:
             for item in items:
                 nm = item.get("report_nm", "")
-                if any(kw in nm for kw in ["주주총회", "정기총회", "소집결의", "소집공고", "총회소집"]):
-                    rcept_no = item["rcept_no"]
-                    report_nm_full = nm
-                    rcept_dt = item.get("rcept_dt", "")
+                if any(kw in nm for kw in ["주주총회", "정기총회", "소집결의", "소집공고"]):
+                    rcept_no  = item["rcept_no"]
+                    report_nm = nm
+                    rcept_dt  = item.get("rcept_dt", "")
                     break
-    
         if not rcept_no:
             return None, f"주주총회 공시 없음 (corp_code: {corp_code})"
 
@@ -386,38 +383,190 @@ def search_dart_api(company_name: str, api_key: str) -> tuple[str | None, str]:
 # ② K-Vote (한국예탁결제원 전자투표) 크롤링
 # ─────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-# ② K-Vote (한국예탁결제원 전자투표) 크롤링
-# ─────────────────────────────────────────────
+def _corp_name_match(query: str, candidate: str) -> bool:
+    """회사명 부분 매칭 (양방향 + 핵심어 추출)"""
+    q = query.strip()
+    c = candidate.strip()
+    if not q or not c:
+        return False
+    if q in c or c in q:
+        return True
+    # 괄호·공백 제거 후 재비교
+    import unicodedata
+    def normalize(s):
+        return re.sub(r"[\s\(\)（）㈜주식회사]", "", s)
+    return normalize(q) in normalize(c) or normalize(c) in normalize(q)
+
+
+def _extract_date(text: str) -> str | None:
+    """텍스트에서 2026-03-XX 날짜 추출"""
+    # "2026.03.19", "2026-03-19", "2026년 3월 19일" 등
+    patterns = [
+        r"(2026)[.\-/년\s]*(0?3)[.\-/월\s]*([0-2]?\d|3[01])",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            candidate = f"2026-03-{int(m.group(3)):02d}"
+            if validate_march_2026(candidate):
+                return candidate
+    return None
+
+
 def search_kvote(company_name: str) -> tuple[str | None, str]:
-    """ evote.ksd.or.kr 주주총회 일정 검색 POST /evote/main/agm/agmScheduleList.do """
-    
-    # ← 여기! 함수 맨 위(try 바로 위 또는 바로 아래)에 추가
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": "https://evote.ksd.or.kr/",
-        "Connection": "keep-alive"
-    }
-    
+    """
+    K-Vote(한국예탁결제원 전자투표) 에서 주주총회 일정 크롤링.
+    API 키 불필요. 여러 엔드포인트·파싱 방식을 순차 시도.
+    """
+    from bs4 import BeautifulSoup
+
+    BASE = "https://evote.ksd.or.kr"
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
+    sess.headers["Referer"] = BASE + "/"
+
+    # ── 시도 1: 메인 일정 검색 POST (JSON 응답) ──
     try:
-        url = "https://evote.ksd.or.kr/evote/main/agm/agmScheduleList.do"
-        payload = {
-            "agmSchdSrchCnt": "50",
-            "agmSchdSrchTypCd": "1",  # 1=회사명
-            "srchCrpNm": company_name,
-            "agmSchdSrchYr": "2026",
-        }
-        resp = requests.post(url, data=payload, headers=HEADERS, timeout=12)
-        resp.raise_for_status()
-        
-        # ... (나머지 코드 그대로: BeautifulSoup 파싱, JSON 대비 등)
-        
+        r = sess.post(
+            BASE + "/evote/main/agm/agmScheduleList.do",
+            data={
+                "agmSchdSrchTypCd": "1",   # 1 = 회사명 검색
+                "srchCrpNm": company_name,
+                "agmSchdSrchYr": "2026",
+                "pageIndex": "1",
+                "recordCountPerPage": "100",
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+
+        # JSON 응답 시도
+        try:
+            jdata = r.json()
+            # 가능한 key 이름들을 모두 시도
+            for list_key in ("list", "data", "result", "agmSchdList", "items"):
+                rows = jdata.get(list_key, [])
+                if not rows:
+                    continue
+                for item in rows:
+                    # 회사명 필드
+                    nm = str(
+                        item.get("crpNm") or item.get("corpNm") or
+                        item.get("agmCrpNm") or item.get("compNm") or ""
+                    )
+                    # 날짜 필드
+                    dt = str(
+                        item.get("agmDt") or item.get("agmSchdDt") or
+                        item.get("agmOpenDt") or item.get("agmDate") or ""
+                    )
+                    if _corp_name_match(company_name, nm):
+                        d = _extract_date(dt) or _extract_date(str(item))
+                        if d:
+                            return d, f"K-Vote ({nm})"
+        except Exception:
+            pass
+
+        # HTML 응답 파싱 시도
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # 모든 테이블에서 회사명 + 날짜 조합 탐색
+        for table in soup.find_all("table"):
+            rows = table.find_all("tr")
+            if len(rows) < 2:
+                continue
+            # 헤더에서 날짜 열 인덱스 추정
+            th_texts = [th.get_text(strip=True) for th in rows[0].find_all(["th", "td"])]
+            date_col = next(
+                (i for i, t in enumerate(th_texts)
+                 if any(kw in t for kw in ["주총일", "총회일", "개최일", "일자", "일정"])),
+                None
+            )
+            name_col = next(
+                (i for i, t in enumerate(th_texts)
+                 if any(kw in t for kw in ["회사", "법인", "기업", "종목"])),
+                0
+            )
+            for tr in rows[1:]:
+                tds = tr.find_all("td")
+                if not tds:
+                    continue
+                nm  = tds[name_col].get_text(strip=True) if len(tds) > name_col else ""
+                if not _corp_name_match(company_name, nm):
+                    continue
+                # 지정된 열 우선, 없으면 행 전체 텍스트
+                if date_col and len(tds) > date_col:
+                    d = _extract_date(tds[date_col].get_text(strip=True))
+                else:
+                    d = _extract_date(tr.get_text(" ", strip=True))
+                if d:
+                    return d, f"K-Vote ({nm})"
+
+        # 테이블 없이 전체 텍스트 스캔 (회사명 찾은 뒤 근처 날짜)
+        full_text = soup.get_text(" ", strip=True)
+        idx = full_text.find(company_name)
+        if idx >= 0:
+            nearby = full_text[max(0, idx - 20): idx + 100]
+            d = _extract_date(nearby)
+            if d:
+                return d, f"K-Vote (텍스트 파싱)"
+
     except requests.exceptions.ConnectionError:
         return None, "K-Vote: 네트워크 오류"
     except Exception as e:
-        return None, f"K-Vote 오류: {e}"
+        pass
+
+    # ── 시도 2: 전체 목록 GET (페이지 파싱 방식) ──
+    try:
+        r2 = sess.get(
+            BASE + "/evote/main/agm/agmScheduleList.do",
+            params={
+                "srchCrpNm": company_name,
+                "agmSchdSrchYr": "2026",
+            },
+            timeout=15,
+        )
+        r2.raise_for_status()
+        soup2 = BeautifulSoup(r2.text, "html.parser")
+
+        # li, div 등에서 회사명·날짜 조합 탐색
+        for tag in soup2.find_all(["li", "div", "tr", "article"]):
+            text = tag.get_text(" ", strip=True)
+            if _corp_name_match(company_name, text[:50]):
+                d = _extract_date(text)
+                if d:
+                    return d, f"K-Vote GET ({company_name})"
+
+    except Exception:
+        pass
+
+    # ── 시도 3: AJAX JSON 엔드포인트 직접 호출 ──
+    ajax_urls = [
+        BASE + "/evote/api/agm/schedule",
+        BASE + "/evote/main/agm/agmScheduleListAjax.do",
+        BASE + "/evote/rest/agm/agmScheduleList",
+    ]
+    for ajax_url in ajax_urls:
+        try:
+            r3 = sess.get(
+                ajax_url,
+                params={"crpNm": company_name, "year": "2026"},
+                timeout=10,
+            )
+            if r3.status_code == 200:
+                jd = r3.json()
+                for list_key in ("list", "data", "result", "items"):
+                    for item in jd.get(list_key, []):
+                        nm = str(item.get("crpNm") or item.get("corpNm") or "")
+                        dt = str(item.get("agmDt") or item.get("agmOpenDt") or "")
+                        if _corp_name_match(company_name, nm):
+                            d = _extract_date(dt)
+                            if d:
+                                return d, f"K-Vote API ({nm})"
+        except Exception:
+            continue
+
+    return None, "K-Vote: 일정 없음 (공시 전이거나 비전자투표 기업일 수 있음)"
+
 
 
 # ─────────────────────────────────────────────
@@ -425,24 +574,33 @@ def search_kvote(company_name: str) -> tuple[str | None, str]:
 # ─────────────────────────────────────────────
 
 def search_agm_date(company_name: str, api_key: str) -> tuple[str | None, str, dict]:
+    """
+    DART + K-Vote 동시 조회 후 교차검증.
+    Returns: (확정날짜 | None, 상태메시지, 상세결과dict)
+    """
     detail = {"dart": (None, ""), "kvote": (None, "")}
 
     # DART 조회
     dart_date, dart_src = search_dart_api(company_name, api_key) if api_key else (None, "API 키 없음")
     detail["dart"] = (dart_date, dart_src)
 
-    # K-Vote 주석 처리 (현재 불안정 + 대기열 문제)
-    # kvote_date, kvote_src = search_kvote(company_name)
-    kvote_date, kvote_src = None, "K-Vote 스킵 (접속 대기열 / 과부하)"
-    detail["kvote"] = (None, kvote_src)
+    # K-Vote 조회 (API 키 불필요)
+    kvote_date, kvote_src = search_kvote(company_name)
+    detail["kvote"] = (kvote_date, kvote_src)
 
-    dart_ok = validate_march_2026(dart_date)
+    dart_ok  = validate_march_2026(dart_date)
     kvote_ok = validate_march_2026(kvote_date)
 
-    # 교차검증 판정 (K-Vote 없으므로 DART 우선)
+    # ── 교차검증 판정 ──
+    if dart_ok and kvote_ok:
+        if dart_date == kvote_date:
+            return dart_date, f"✅ 교차확인 (DART·K-Vote 일치: {dart_date})", detail
+        else:
+            # 불일치 → 둘 다 표시하되 DART 우선
+            return dart_date, f"⚠️ 불일치 DART={dart_date} / K-Vote={kvote_date}", detail
+
     if dart_ok:
-        return dart_date, f"🟢 DART 확인 ({dart_src}) - K-Vote 스킵", detail
-    # ... (나머지 그대로, msgs에 K-Vote 스킵 메시지 추가)
+        return dart_date, f"🟡 DART 단독확인 (K-Vote 미조회)", detail
 
     if kvote_ok:
         return kvote_date, f"🟡 K-Vote 단독확인 (DART 공시 미등록)", detail
@@ -634,6 +792,40 @@ def render_sidebar(state: dict) -> str:
                         state.setdefault("updated_recently", set()).add(corp)
                         state.setdefault("updated_timestamps", {})[corp] = datetime.now().isoformat()
                         updated_n += 1
+        save_state(state)
+        msg = f"✅ {updated_n}개 업데이트됨" if updated_n else "변경 없음"
+        st.sidebar.success(msg)
+        st.rerun()
+
+    # K-Vote 단독 검색 (API 키 불필요)
+    if st.sidebar.button("📋 K-Vote 전체 검색 (API 키 불필요)", use_container_width=True):
+        df = load_excel_data()
+        prog  = st.sidebar.progress(0)
+        results = st.session_state.get("crawl_results", {})
+        corps = df["단체명"].tolist()
+        updated_n = 0
+        for i, corp in enumerate(corps):
+            kvote_date, kvote_src = search_kvote(corp)
+            prog.progress((i + 1) / len(corps), text=f"{corp}…")
+            # 기존 결과에 K-Vote 결과 병합
+            existing = results.get(corp, {"date": None, "source": "", "detail": {}})
+            existing.setdefault("detail", {})["kvote"] = (kvote_date, kvote_src)
+            if validate_march_2026(kvote_date):
+                existing["date"] = existing.get("date") or kvote_date
+                existing["source"] = existing.get("source") or f"K-Vote ({kvote_src})"
+                # 날짜 업데이트
+                r = df[df["단체명"] == corp]
+                if not r.empty:
+                    cur = state["overrides"].get(corp, r.iloc[0]["주주총회일"])
+                    if kvote_date != cur:
+                        state["overrides"][corp] = kvote_date
+                        state.setdefault("updated_recently", set()).add(corp)
+                        state.setdefault("updated_timestamps", {})[corp] = datetime.now().isoformat()
+                        updated_n += 1
+            results[corp] = existing
+            time.sleep(0.3)
+        prog.empty()
+        st.session_state["crawl_results"] = results
         save_state(state)
         msg = f"✅ {updated_n}개 업데이트됨" if updated_n else "변경 없음"
         st.sidebar.success(msg)
