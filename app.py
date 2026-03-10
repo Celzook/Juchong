@@ -4,6 +4,12 @@ import json, os, re, time, calendar, zipfile, io, html
 import xml.etree.ElementTree as ET
 import requests
 from datetime import datetime, date
+from bs4 import BeautifulSoup
+try:
+    import OpenDartReader
+    HAS_ODR = True
+except ImportError:
+    HAS_ODR = False
 
 st.set_page_config(page_title="주주총회 일정 트래커", page_icon="📅",
                    layout="wide", initial_sidebar_state="expanded")
@@ -131,87 +137,74 @@ def find_corp_code(corp_dict: dict, name: str):
     return cands[0][1] if cands else None
 
 
+def _parse_dart_date(text: str):
+    """BeautifulSoup get_text() 결과에서 주총 일시 추출 → 'YYYY-MM-DD' 또는 None"""
+    # 패턴 1: "일 시 ... 2026년 3월 26일" (사용자 코드와 동일)
+    m = re.search(r'일\s*시.*?(\d{4})[-년]\s*(\d{1,2})[-월]\s*(\d{1,2})[일]?', text, re.DOTALL)
+    if m:
+        d = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        if validate_march_2026(d):
+            return d
+    # 패턴 2: "2026년 3월 26일" 형태 전체 문서에서
+    m = re.search(r'(2026)[년\s.]*(\d{1,2})[월\s.]*(\d{1,2})[일]', text)
+    if m:
+        d = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        if validate_march_2026(d):
+            return d
+    # 패턴 3: 숫자 형식 2026-03-XX / 2026.03.XX
+    m = re.search(r'\b(2026)[.\-](0?[1-9]|1[0-2])[.\-](0?[1-9]|[12]\d|3[01])\b', text)
+    if m:
+        d = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        if validate_march_2026(d):
+            return d
+    return None
+
+
 def search_dart_api(company_name: str, api_key: str):
-    """DART API로 주총 확정일 조회. Returns (날짜|None, 메시지)"""
+    """OpenDartReader로 주총 확정일 조회. Returns (날짜|None, 메시지)"""
     if not api_key:
         return None, "API 키 없음"
+    if not HAS_ODR:
+        return None, "OpenDartReader 미설치 (pip install opendartreader)"
     try:
+        # 기업코드 조회 (corp_code.xml 캐시 활용)
         corp_dict = load_corp_codes(api_key)
         corp_code = find_corp_code(corp_dict, company_name)
         if not corp_code:
             return None, "기업코드 미발견"
 
+        dart = OpenDartReader(api_key)
         year = datetime.now().year
-        r = requests.get(
-            "https://opendart.fss.or.kr/api/list.json",
-            params={"crtfc_key": api_key, "corp_code": corp_code,
-                    "bgn_de": f"{year}0101", "end_de": f"{year}0331",
-                    "last_report_at": "N", "page_no": "1", "page_count": "100"},
-            timeout=12)
-        data = r.json()
-        if data.get("status") != "000":
-            return None, f"DART: {data.get('message','오류')}"
+        reports = dart.list(corp_code, start=f"{year}-01-01", end=f"{year}-03-31",
+                            kind="A")  # kind="A": 정기공시
 
-        rcept_no = report_nm = ""
-        for kw in ["주주총회소집결의", "주주총회소집공고", "주주총회", "정기총회"]:
-            for item in data.get("list", []):
-                if kw in item.get("report_nm",""):
-                    rcept_no  = item["rcept_no"]
-                    report_nm = item["report_nm"]
-                    break
-            if rcept_no: break
-
-        if not rcept_no:
+        if not isinstance(reports, pd.DataFrame) or reports.empty:
             return None, "공시 없음"
 
-        # 공시 본문 문서에서 날짜 파싱 (.htm/.html/.xml 모두 시도)
-        rz = requests.get(
-            "https://opendart.fss.or.kr/api/document.xml",
-            params={"crtfc_key": api_key, "rcept_no": rcept_no.replace("-","")},
-            timeout=20)
-        rz.raise_for_status()
-        zf = zipfile.ZipFile(io.BytesIO(rz.content))
+        # 소집결의 → 소집공고 순으로 우선
+        agm = reports[reports["report_nm"].str.contains("주주총회소집", na=False)]
+        if agm.empty:
+            return None, "주주총회소집 공시 없음"
 
-        # DART 문서는 .htm이 대부분, .xml도 포함
-        doc_names = [f for f in zf.namelist()
-                     if f.lower().endswith((".htm", ".html", ".xml"))
-                     and not f.lower().startswith("__")]
-        if not doc_names:
-            doc_names = zf.namelist()  # 확장자 무관하게 전체 시도
-        if not doc_names:
-            return None, "문서 없음"
+        latest      = agm.iloc[0]
+        rcept_no    = latest["rcept_no"]
+        report_nm   = latest["report_nm"]
 
-        raw = ""
-        for fname in doc_names:
-            try:
-                raw += zf.read(fname).decode("utf-8", errors="ignore")
-            except Exception:
-                pass
+        # 공시 원문 HTML → BeautifulSoup → 텍스트
+        doc_html = dart.document(rcept_no)
+        soup     = BeautifulSoup(doc_html, "html.parser")
+        text     = soup.get_text()
 
-        # HTML 태그 제거 후 텍스트만 추출
-        clean = re.sub(r"<[^>]+>", " ", raw)
-        clean = html.unescape(clean)
-
-        # 날짜 파싱 패턴 (광범위 — HTML 파싱 후 텍스트 기준)
-        patterns = [
-            # "일 시 : 2026년 3월 26일" 형태
-            r"(?:일\s*시|일시|개최일|소집일)[^\d]{0,20}(2026)[년\s\.]*(\d{1,2})[월\s\.]*(\d{1,2})",
-            # "2026년 3월 26일" 형태 (주주총회 앞뒤 20자 이내)
-            r"(?:주주총회|정기총회)[^2]{0,40}?(2026)[년\s\.]*(\d{1,2})[월\s\.]*(\d{1,2})",
-            # 역방향 — "2026년 3월 XX일 ... 주주총회"
-            r"(2026)[년\s\.]*(\d{1,2})[월\s\.]*(\d{1,2})[일\s][^주]{0,40}(?:주주총회|정기총회|소집)",
-            # 숫자 형식 2026-03-XX 또는 2026.03.XX
-            r"\b(2026)[.\-](0?[1-9]|1[0-2])[.\-](0?[1-9]|[12]\d|3[01])\b",
-            # 마지막 수단: 문서 내 2026년 3월 XX일 전체
-            r"(2026)[년\s\.]+(\d{1,2})[월\s\.]+(\d{1,2})[일]",
-        ]
-        for pat in patterns:
-            for m in re.finditer(pat, clean, re.IGNORECASE):
-                d = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-                if validate_march_2026(d):
-                    return d, f"DART ({report_nm[:20]})"
+        found = _parse_dart_date(text)
+        if found:
+            return found, f"DART ({report_nm[:20]})"
 
         return None, f"날짜 파싱 실패 ({report_nm[:20]})"
+
+    except requests.exceptions.ConnectionError:
+        return None, "네트워크 오류"
+    except Exception as e:
+        return None, f"오류: {str(e)[:50]}"
 
     except requests.exceptions.ConnectionError:
         return None, "네트워크 오류"
