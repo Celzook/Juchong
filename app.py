@@ -141,10 +141,12 @@ def save_state(state):
 
 def init_session():
     for key, val in [
-        ("state",         load_state()),
-        ("change_modal",  None),
-        ("expanded_prev", set()),
-        ("crawl_results", {}),
+        ("state",          load_state()),
+        ("change_modal",   None),
+        ("inline_change",  None),   # 인라인 기업변경: company name or None
+        ("expanded_prev",  set()),
+        ("crawl_results",  {}),
+        ("search_log",     None),   # 검색 완료 로그 {updated:[..], unchanged:[..]}
     ]:
         if key not in st.session_state:
             st.session_state[key] = val
@@ -869,18 +871,18 @@ def render_sidebar(state: dict) -> tuple[str, str]:
                 st.sidebar.error(str(e))
                 return
         prog = st.sidebar.progress(0)
-        results = st.session_state.get("crawl_results", {})
-        updated_n = 0
+        results  = st.session_state.get("crawl_results", {})
+        updated_corps   = []   # (corp, old_date, new_date, src)
+        unchanged_corps = []   # (corp, date, src)
+        no_result_corps = []   # corp
         for i, corp in enumerate(corps):
             prog.progress((i + 1) / len(corps), text=f"{corp}…")
             if label == "kvote":
                 found, src = search_kvote(corp)
                 detail_update = {"kvote": (found, src)}
-                ai_d = ai_s = None
             elif label == "ai":
                 found, src = search_via_claude(corp, anthropic_key)
                 detail_update = {"ai": (found, src)}
-                ai_d, ai_s = found, src
             else:  # full
                 found, src, detail_update = search_agm_date(
                     corp, dart_api_key if use_dart else "",
@@ -889,22 +891,32 @@ def render_sidebar(state: dict) -> tuple[str, str]:
             existing = results.get(corp, {"date": None, "source": "", "detail": {}})
             existing["detail"] = {**existing.get("detail", {}), **detail_update}
             if validate_march_2026(found):
+                r_row = df[df["단체명"] == corp]
                 cur = state["overrides"].get(
-                    corp, df[df["단체명"] == corp].iloc[0]["주주총회일"]
-                    if not df[df["단체명"] == corp].empty else "")
+                    corp, r_row.iloc[0]["주주총회일"] if not r_row.empty else "")
                 if found != cur:
                     state["overrides"][corp] = found
                     state.setdefault("updated_recently", set()).add(corp)
                     state.setdefault("updated_timestamps", {})[corp] = datetime.now().isoformat()
-                    updated_n += 1
+                    updated_corps.append((corp, cur, found, src))
+                else:
+                    unchanged_corps.append((corp, found, src))
                 existing["date"] = existing.get("date") or found
                 existing["source"] = src
+            else:
+                no_result_corps.append((corp, src))
             results[corp] = existing
             time.sleep(0.4)
         prog.empty()
         st.session_state["crawl_results"] = results
+        st.session_state["search_log"] = {
+            "label":     label,
+            "updated":   updated_corps,
+            "unchanged": unchanged_corps,
+            "no_result": no_result_corps,
+            "ran_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
         save_state(state)
-        st.sidebar.success(f"✅ {updated_n}개 업데이트됨" if updated_n else "변경 없음")
         st.rerun()
 
     df = load_excel_data()
@@ -1053,21 +1065,75 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_api_key: str, anthropic
                                     unsafe_allow_html=True)
 
             with c4:
-                if st.button("✏️ 기업변경", key=f"chg_{company}"):
-                    st.session_state["change_modal"] = {
-                        "old_name": company, "orig_date": orig}
+                inline_active = st.session_state.get("inline_change") == company
+                btn_label = "✖ 취소" if inline_active else "✏️ 기업변경"
+                if st.button(btn_label, key=f"chg_{company}"):
+                    st.session_state["inline_change"] = None if inline_active else company
                     st.rerun()
 
+            # ── 이전 기업 정보 펼침 ──
             if has_prev and company in st.session_state["expanded_prev"]:
                 prev = changes[company]
                 st.markdown(
                     f'<div style="background:#f1f5f9;border-left:4px solid #94a3b8;'
-                    f'border-radius:0 6px 6px 0;padding:7px 14px;margin:3px 0 8px 0;'
+                    f'border-radius:0 6px 6px 0;padding:7px 14px;margin:3px 0 4px 0;'
                     f'font-size:.85em;color:#475569;">'
                     f'🔁 <strong>변경 1회 전</strong>: {prev["prev_name"]} '
                     f'| 날짜: {prev["prev_date"]} '
                     f'| {prev["changed_at"]}</div>',
                     unsafe_allow_html=True)
+
+            # ── 인라인 기업변경 폼 ──
+            if st.session_state.get("inline_change") == company:
+                with st.container():
+                    st.markdown(
+                        f'<div style="background:#fffbeb;border:1.5px solid #f59e0b;'
+                        f'border-radius:8px;padding:14px 18px;margin:6px 0 10px 0;">',
+                        unsafe_allow_html=True)
+                    st.markdown(
+                        f"✏️ **{company}** 을 다른 기업으로 교체합니다. "
+                        f"기존 기업은 '변경 1회 전'으로 기록됩니다.")
+                    ic1, ic2 = st.columns([3, 2])
+                    with ic1:
+                        new_name = st.text_input(
+                            "새 기업명", placeholder="예: 삼성SDI",
+                            key=f"ic_name_{company}")
+                    with ic2:
+                        opt = st.radio(
+                            "날짜", ["직접 입력", "미정"],
+                            horizontal=True, key=f"ic_opt_{company}")
+                    new_date = "미정"
+                    if opt == "직접 입력":
+                        new_date = st.date_input(
+                            "날짜 선택", key=f"ic_date_{company}"
+                        ).strftime("%Y-%m-%d")
+                    bc1, bc2 = st.columns([1, 1])
+                    with bc1:
+                        if st.button("✅ 확정", type="primary",
+                                     use_container_width=True,
+                                     key=f"ic_ok_{company}"):
+                            nn = (new_name or "").strip()
+                            if nn:
+                                state.setdefault("changes", {})[nn] = {
+                                    "prev_name": company,
+                                    "prev_date": state["overrides"].get(company, orig),
+                                    "changed_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                }
+                                state["overrides"].pop(company, None)
+                                state["overrides"][nn] = new_date
+                                state.setdefault("name_replacements", {})[company] = nn
+                                save_state(state)
+                                load_excel_data.clear()
+                                st.session_state["inline_change"] = None
+                                st.rerun()
+                            else:
+                                st.error("기업명을 입력하세요.")
+                    with bc2:
+                        if st.button("❌ 취소", use_container_width=True,
+                                     key=f"ic_cancel_{company}"):
+                            st.session_state["inline_change"] = None
+                            st.rerun()
+                    st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("")
 
@@ -1121,24 +1187,173 @@ def render_change_modal(state: dict):
 # 메인
 # ─────────────────────────────────────────────
 
+def render_search_log():
+    """검색 완료 후 업데이트/미변경 결과를 메인 화면에 표시"""
+    log = st.session_state.get("search_log")
+    if not log:
+        return
+
+    updated   = log.get("updated", [])
+    unchanged = log.get("unchanged", [])
+    no_result = log.get("no_result", [])
+    ran_at    = log.get("ran_at", "")
+    lbl_map   = {"full": "전체 교차검증", "kvote": "K-Vote", "ai": "AI 웹검색"}
+    lbl       = lbl_map.get(log.get("label", ""), "검색")
+
+    with st.expander(
+        f"🔎 [{lbl}] 검색 결과 — {ran_at}  "
+        f"| 업데이트 **{len(updated)}건** / 변경없음 {len(unchanged)}건 / 미조회 {len(no_result)}건",
+        expanded=True,
+    ):
+        col_close, _ = st.columns([1, 5])
+        with col_close:
+            if st.button("✖ 닫기", key="close_log"):
+                st.session_state["search_log"] = None
+                st.rerun()
+
+        if updated:
+            st.markdown("#### 📢 업데이트된 기업")
+            rows = []
+            for corp, old, new, src in updated:
+                rows.append({
+                    "기업": corp,
+                    "이전 날짜": old or "미정",
+                    "새 날짜": new,
+                    "출처": src,
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("업데이트된 기업이 없습니다.")
+
+        if unchanged:
+            with st.expander(f"변경 없음 ({len(unchanged)}건)"):
+                rows2 = [{"기업": c, "날짜": d, "출처": s} for c, d, s in unchanged]
+                st.dataframe(pd.DataFrame(rows2), use_container_width=True, hide_index=True)
+
+        if no_result:
+            with st.expander(f"조회 실패 / 공시 없음 ({len(no_result)}건)"):
+                rows3 = [{"기업": c, "사유": s} for c, s in no_result]
+                st.dataframe(pd.DataFrame(rows3), use_container_width=True, hide_index=True)
+
+
+def render_ai_results_tab(df: pd.DataFrame, state: dict):
+    """AI 웹검색 결과 탭 — 전체 종목 리스트"""
+    crawl = st.session_state.get("crawl_results", {})
+    overrides = state["overrides"]
+
+    st.markdown("### 🤖 AI 웹검색 주총일 확인 결과")
+    st.caption("사이드바의 '🤖 AI 웹검색만' 또는 '🔍 전체 교차검증' 실행 후 결과가 표시됩니다.")
+
+    rows = []
+    for _, row in df.iterrows():
+        corp   = row["단체명"]
+        cur    = overrides.get(corp, row["주주총회일"])
+        res    = crawl.get(corp, {})
+        detail = res.get("detail", {})
+        ai_d, ai_s = detail.get("ai", (None, "미검색"))
+        dart_d, _  = detail.get("dart",  (None, ""))
+        kvote_d, _ = detail.get("kvote", (None, ""))
+
+        match = ""
+        if validate_march_2026(ai_d):
+            if ai_d == dart_d == kvote_d:
+                match = "✅ 3소스 일치"
+            elif ai_d == dart_d or ai_d == kvote_d:
+                match = "🟡 2소스 일치"
+            elif validate_march_2026(dart_d) or validate_march_2026(kvote_d):
+                match = "⚠️ 불일치"
+            else:
+                match = "🔵 AI 단독"
+
+        rows.append({
+            "기업":      corp,
+            "현재 날짜": cur,
+            "AI 검색 결과": ai_d or "—",
+            "DART":     dart_d or "—",
+            "K-Vote":   kvote_d or "—",
+            "교차검증":  match or ("—" if not ai_d else "미검색"),
+            "AI 소스":   (ai_s or "")[:60],
+            "필수단체":  "🔴" if row.get("비고") == "필수단체" else "",
+        })
+
+    result_df = pd.DataFrame(rows)
+
+    # 필터
+    fcol1, fcol2, fcol3 = st.columns(3)
+    with fcol1:
+        show_filter = st.selectbox(
+            "필터", ["전체", "AI결과 있음", "업데이트 가능", "교차확인됨", "미검색"],
+            key="ai_tab_filter")
+    with fcol2:
+        req_only = st.checkbox("필수단체만", key="ai_tab_req")
+    with fcol3:
+        search_q = st.text_input("기업명 검색", key="ai_tab_search", placeholder="검색…")
+
+    fdf = result_df.copy()
+    if show_filter == "AI결과 있음":
+        fdf = fdf[fdf["AI 검색 결과"] != "—"]
+    elif show_filter == "업데이트 가능":
+        fdf = fdf[(fdf["AI 검색 결과"] != "—") & (fdf["AI 검색 결과"] != fdf["현재 날짜"])]
+    elif show_filter == "교차확인됨":
+        fdf = fdf[fdf["교차검증"].str.contains("일치", na=False)]
+    elif show_filter == "미검색":
+        fdf = fdf[fdf["AI 검색 결과"] == "—"]
+    if req_only:
+        fdf = fdf[fdf["필수단체"] == "🔴"]
+    if search_q:
+        fdf = fdf[fdf["기업"].str.contains(search_q, na=False)]
+
+    st.caption(f"표시: {len(fdf)} / 전체 {len(result_df)}건")
+
+    st.dataframe(
+        fdf.drop(columns=["필수단체"]),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "기업":          st.column_config.TextColumn(width="medium"),
+            "AI 검색 결과":  st.column_config.TextColumn(width="small"),
+            "현재 날짜":     st.column_config.TextColumn(width="small"),
+            "DART":          st.column_config.TextColumn(width="small"),
+            "K-Vote":        st.column_config.TextColumn(width="small"),
+            "교차검증":      st.column_config.TextColumn(width="medium"),
+        }
+    )
+
+    # 일괄 적용 버튼
+    applicable = fdf[
+        (fdf["AI 검색 결과"] != "—") &
+        (fdf["AI 검색 결과"] != fdf["현재 날짜"])
+    ]
+    if not applicable.empty:
+        st.markdown(f"---")
+        st.markdown(f"**📢 적용 가능한 업데이트: {len(applicable)}건**")
+        if st.button(f"✅ AI 검색 결과 {len(applicable)}건 일괄 적용",
+                     type="primary", key="ai_apply_all"):
+            for _, r in applicable.iterrows():
+                corp = r["기업"]
+                new_d = r["AI 검색 결과"]
+                if validate_march_2026(new_d):
+                    state["overrides"][corp] = new_d
+                    state.setdefault("updated_recently", set()).add(corp)
+                    state.setdefault("updated_timestamps", {})[corp] = datetime.now().isoformat()
+            save_state(state)
+            st.success(f"{len(applicable)}건 적용 완료!")
+            st.rerun()
+
+
 def main():
     init_session()
     state = st.session_state["state"]
     dart_api_key, anthropic_key = render_sidebar(state)
 
     # 헤더
-    col_t, col_v = st.columns([5, 2])
-    with col_t:
-        st.title("📅 주주총회 일정 트래커")
-        ts = max(state.get("updated_timestamps", {}).values(), default=None)
-        if ts:
-            st.caption(f"마지막 DART 업데이트: {ts[:16]}")
-    with col_v:
-        st.markdown("<br>", unsafe_allow_html=True)
-        view = st.radio("보기 모드", ["📅 달력", "📋 리스트"],
-                        horizontal=True, key="view_radio")
+    st.title("📅 주주총회 일정 트래커")
+    ts = max(state.get("updated_timestamps", {}).values(), default=None)
+    if ts:
+        st.caption(f"마지막 업데이트: {ts[:16]}")
 
-    render_change_modal(state)
+    # 검색 결과 로그 (있을 때만 표시)
+    render_search_log()
 
     # 데이터 로드
     try:
@@ -1153,8 +1368,10 @@ def main():
         df["단체명"] = df["단체명"].replace(repl)
         df = df.drop_duplicates(subset=["단체명"]).reset_index(drop=True)
 
-    if "달력" in view:
-        # 통계
+    # ── 탭 ──
+    tab_cal, tab_list, tab_ai = st.tabs(["📅 달력", "📋 리스트", "🤖 AI 검색결과"])
+
+    with tab_cal:
         overrides = state["overrides"]
         conf_n = sum(1 for _, r in df.iterrows()
                      if is_confirmed(overrides.get(r["단체명"], r["주주총회일"])))
@@ -1167,16 +1384,15 @@ def main():
         m3.metric("⏳ 미정", pend_n)
         m4.metric("🔴 필수단체", int((df["비고"] == "필수단체").sum()))
         st.markdown("---")
-
-        day_map = build_day_map(df, state)
-
-        # 3월 달력 고정
         st.subheader("2026년 3월")
-        st.markdown(render_calendar_html(2026, 3, day_map),
-                    unsafe_allow_html=True)
+        day_map = build_day_map(df, state)
+        st.markdown(render_calendar_html(2026, 3, day_map), unsafe_allow_html=True)
 
-    else:
+    with tab_list:
         render_list_view(df, state, dart_api_key, anthropic_key)
+
+    with tab_ai:
+        render_ai_results_tab(df, state)
 
 
 if __name__ == "__main__":
