@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import json, os, re, time, calendar, zipfile, io
+import json, os, re, time, calendar, zipfile, io, html
 import xml.etree.ElementTree as ET
 import requests
 from datetime import datetime, date
@@ -164,26 +164,49 @@ def search_dart_api(company_name: str, api_key: str):
         if not rcept_no:
             return None, "공시 없음"
 
-        # 공시 본문 XML에서 날짜 파싱
+        # 공시 본문 문서에서 날짜 파싱 (.htm/.html/.xml 모두 시도)
         rz = requests.get(
             "https://opendart.fss.or.kr/api/document.xml",
             params={"crtfc_key": api_key, "rcept_no": rcept_no.replace("-","")},
             timeout=20)
         rz.raise_for_status()
         zf = zipfile.ZipFile(io.BytesIO(rz.content))
-        xml_names = [f for f in zf.namelist() if f.lower().endswith(".xml")]
-        if not xml_names:
-            return None, "XML 없음"
-        raw = zf.read(xml_names[0]).decode("utf-8", errors="ignore")
 
-        # 날짜 파싱 패턴 (광범위)
+        # DART 문서는 .htm이 대부분, .xml도 포함
+        doc_names = [f for f in zf.namelist()
+                     if f.lower().endswith((".htm", ".html", ".xml"))
+                     and not f.lower().startswith("__")]
+        if not doc_names:
+            doc_names = zf.namelist()  # 확장자 무관하게 전체 시도
+        if not doc_names:
+            return None, "문서 없음"
+
+        raw = ""
+        for fname in doc_names:
+            try:
+                raw += zf.read(fname).decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+
+        # HTML 태그 제거 후 텍스트만 추출
+        clean = re.sub(r"<[^>]+>", " ", raw)
+        clean = html.unescape(clean)
+
+        # 날짜 파싱 패턴 (광범위 — HTML 파싱 후 텍스트 기준)
         patterns = [
-            r"(?:주주총회|정기총회|소집일|개최일)[^0-9]{0,30}?(\d{4})[년.\s\-]*(\d{1,2})[월.\s\-]*(\d{1,2})",
-            r"(\d{4})[.\-년\s]+(\d{1,2})[.\-월\s]+(\d{1,2})[^0-9]{0,30}(?:주주총회|소집|개최)",
+            # "일 시 : 2026년 3월 26일" 형태
+            r"(?:일\s*시|일시|개최일|소집일)[^\d]{0,20}(2026)[년\s\.]*(\d{1,2})[월\s\.]*(\d{1,2})",
+            # "2026년 3월 26일" 형태 (주주총회 앞뒤 20자 이내)
+            r"(?:주주총회|정기총회)[^2]{0,40}?(2026)[년\s\.]*(\d{1,2})[월\s\.]*(\d{1,2})",
+            # 역방향 — "2026년 3월 XX일 ... 주주총회"
+            r"(2026)[년\s\.]*(\d{1,2})[월\s\.]*(\d{1,2})[일\s][^주]{0,40}(?:주주총회|정기총회|소집)",
+            # 숫자 형식 2026-03-XX 또는 2026.03.XX
             r"\b(2026)[.\-](0?[1-9]|1[0-2])[.\-](0?[1-9]|[12]\d|3[01])\b",
+            # 마지막 수단: 문서 내 2026년 3월 XX일 전체
+            r"(2026)[년\s\.]+(\d{1,2})[월\s\.]+(\d{1,2})[일]",
         ]
         for pat in patterns:
-            for m in re.finditer(pat, raw, re.IGNORECASE):
+            for m in re.finditer(pat, clean, re.IGNORECASE):
                 d = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
                 if validate_march_2026(d):
                     return d, f"DART ({report_nm[:20]})"
