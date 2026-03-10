@@ -380,196 +380,286 @@ def search_dart_api(company_name: str, api_key: str) -> tuple[str | None, str]:
 
 
 # ─────────────────────────────────────────────
-# ② K-Vote (한국예탁결제원 전자투표) 크롤링
+# ─────────────────────────────────────────────
+# ② K-Vote 크롤링
 # ─────────────────────────────────────────────
 
-def _corp_name_match(query: str, candidate: str) -> bool:
-    """회사명 부분 매칭 (양방향 + 핵심어 추출)"""
-    q = query.strip()
-    c = candidate.strip()
-    if not q or not c:
+def _corp_match(query: str, candidate: str) -> bool:
+    """회사명 부분 매칭 (괄호·공백·㈜ 정규화)"""
+    if not query or not candidate:
         return False
-    if q in c or c in q:
+    if query in candidate or candidate in query:
         return True
-    # 괄호·공백 제거 후 재비교
-    import unicodedata
-    def normalize(s):
-        return re.sub(r"[\s\(\)（）㈜주식회사]", "", s)
-    return normalize(q) in normalize(c) or normalize(c) in normalize(q)
+    def norm(s):
+        return re.sub(r"[\s\(\)（）㈜()]|주식회사", "", s)
+    q, c = norm(query), norm(candidate)
+    return q in c or c in q
 
 
-def _extract_date(text: str) -> str | None:
-    """텍스트에서 2026-03-XX 날짜 추출"""
-    # "2026.03.19", "2026-03-19", "2026년 3월 19일" 등
-    patterns = [
-        r"(2026)[.\-/년\s]*(0?3)[.\-/월\s]*([0-2]?\d|3[01])",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text)
-        if m:
-            candidate = f"2026-03-{int(m.group(3)):02d}"
-            if validate_march_2026(candidate):
-                return candidate
+def _pick_date(text: str) -> str | None:
+    """텍스트에서 2026-03-XX 추출"""
+    m = re.search(
+        r"2026[.\-/년\s]*0?3[.\-/월\s]*([0-2]?\d|3[01])[.\-/일\s]?",
+        str(text)
+    )
+    if m:
+        d = f"2026-03-{int(m.group(1)):02d}"
+        return d if validate_march_2026(d) else None
     return None
 
 
 def search_kvote(company_name: str) -> tuple[str | None, str]:
     """
-    K-Vote(한국예탁결제원 전자투표) 에서 주주총회 일정 크롤링.
-    API 키 불필요. 여러 엔드포인트·파싱 방식을 순차 시도.
+    K-Vote(evote.ksd.or.kr) 에서 주주총회 일정 크롤링.
+    POST → HTML table 파싱 → JSON 파싱 → GET fallback 순으로 시도.
     """
     from bs4 import BeautifulSoup
 
     BASE = "https://evote.ksd.or.kr"
+    hdrs = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/json,*/*",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Referer": BASE + "/",
+        "Origin": BASE,
+    }
+
     sess = requests.Session()
-    sess.headers.update(HEADERS)
-    sess.headers["Referer"] = BASE + "/"
+    sess.headers.update(hdrs)
 
-    # ── 시도 1: 메인 일정 검색 POST (JSON 응답) ──
-    try:
-        r = sess.post(
-            BASE + "/evote/main/agm/agmScheduleList.do",
-            data={
-                "agmSchdSrchTypCd": "1",   # 1 = 회사명 검색
-                "srchCrpNm": company_name,
-                "agmSchdSrchYr": "2026",
-                "pageIndex": "1",
-                "recordCountPerPage": "100",
-            },
-            timeout=15,
-        )
-        r.raise_for_status()
-
-        # JSON 응답 시도
-        try:
-            jdata = r.json()
-            # 가능한 key 이름들을 모두 시도
-            for list_key in ("list", "data", "result", "agmSchdList", "items"):
-                rows = jdata.get(list_key, [])
-                if not rows:
+    # ── 방법 A: POST 검색 (회사명) ──
+    for endpoint in [
+        "/evote/main/agm/agmScheduleList.do",
+        "/evote/main/evote/evoteScheduleList.do",
+    ]:
+        for payload in [
+            # 형식 1
+            {"agmSchdSrchTypCd": "1", "srchCrpNm": company_name,
+             "agmSchdSrchYr": "2026", "pageIndex": "1", "recordCountPerPage": "100"},
+            # 형식 2 (파라미터명 변형)
+            {"searchType": "1", "crpNm": company_name,
+             "year": "2026", "pageIndex": "1"},
+        ]:
+            try:
+                r = sess.post(BASE + endpoint, data=payload, timeout=15)
+                if r.status_code != 200:
                     continue
-                for item in rows:
-                    # 회사명 필드
-                    nm = str(
-                        item.get("crpNm") or item.get("corpNm") or
-                        item.get("agmCrpNm") or item.get("compNm") or ""
-                    )
-                    # 날짜 필드
-                    dt = str(
-                        item.get("agmDt") or item.get("agmSchdDt") or
-                        item.get("agmOpenDt") or item.get("agmDate") or ""
-                    )
-                    if _corp_name_match(company_name, nm):
-                        d = _extract_date(dt) or _extract_date(str(item))
+
+                # JSON 우선 시도
+                try:
+                    jd = r.json()
+                    for lk in ("list", "data", "result", "agmList", "items", "agmSchdList"):
+                        for item in jd.get(lk, []):
+                            nm = str(item.get("crpNm") or item.get("corpNm") or
+                                     item.get("agmCrpNm") or item.get("compNm") or "")
+                            dt = str(item.get("agmDt") or item.get("agmSchdDt") or
+                                     item.get("agmOpenDt") or item.get("agmDate") or "")
+                            if _corp_match(company_name, nm):
+                                d = _pick_date(dt) or _pick_date(str(item))
+                                if d:
+                                    return d, f"K-Vote ({nm})"
+                except Exception:
+                    pass
+
+                # HTML 파싱
+                soup = BeautifulSoup(r.text, "html.parser")
+                for table in soup.find_all("table"):
+                    rows = table.find_all("tr")
+                    if len(rows) < 2:
+                        continue
+                    # 헤더로 열 위치 추정
+                    headers = [th.get_text(strip=True)
+                               for th in (rows[0].find_all("th") or rows[0].find_all("td"))]
+                    name_idx = next((i for i, h in enumerate(headers)
+                                     if any(k in h for k in ["회사", "법인", "기업", "종목"])), 0)
+                    date_idx = next((i for i, h in enumerate(headers)
+                                     if any(k in h for k in ["주총", "총회", "개최", "일자", "일정"])), None)
+                    for tr in rows[1:]:
+                        tds = tr.find_all("td")
+                        if not tds:
+                            continue
+                        nm = tds[name_idx].get_text(strip=True) if len(tds) > name_idx else ""
+                        if not _corp_match(company_name, nm):
+                            continue
+                        # 날짜 열 우선, 없으면 행 전체
+                        dt_text = (tds[date_idx].get_text(strip=True)
+                                   if date_idx and len(tds) > date_idx
+                                   else tr.get_text(" ", strip=True))
+                        d = _pick_date(dt_text)
                         if d:
                             return d, f"K-Vote ({nm})"
-        except Exception:
-            pass
 
-        # HTML 응답 파싱 시도
-        soup = BeautifulSoup(r.text, "html.parser")
+                # 페이지 전체 텍스트에서 회사 근처 날짜 탐색
+                full = soup.get_text(" ")
+                idx = full.find(company_name)
+                if idx >= 0:
+                    d = _pick_date(full[max(0, idx - 30): idx + 120])
+                    if d:
+                        return d, "K-Vote (텍스트)"
 
-        # 모든 테이블에서 회사명 + 날짜 조합 탐색
-        for table in soup.find_all("table"):
-            rows = table.find_all("tr")
-            if len(rows) < 2:
+            except requests.exceptions.ConnectionError:
+                return None, "K-Vote: 네트워크 오류"
+            except Exception:
                 continue
-            # 헤더에서 날짜 열 인덱스 추정
-            th_texts = [th.get_text(strip=True) for th in rows[0].find_all(["th", "td"])]
-            date_col = next(
-                (i for i, t in enumerate(th_texts)
-                 if any(kw in t for kw in ["주총일", "총회일", "개최일", "일자", "일정"])),
-                None
-            )
-            name_col = next(
-                (i for i, t in enumerate(th_texts)
-                 if any(kw in t for kw in ["회사", "법인", "기업", "종목"])),
-                0
-            )
-            for tr in rows[1:]:
-                tds = tr.find_all("td")
-                if not tds:
-                    continue
-                nm  = tds[name_col].get_text(strip=True) if len(tds) > name_col else ""
-                if not _corp_name_match(company_name, nm):
-                    continue
-                # 지정된 열 우선, 없으면 행 전체 텍스트
-                if date_col and len(tds) > date_col:
-                    d = _extract_date(tds[date_col].get_text(strip=True))
-                else:
-                    d = _extract_date(tr.get_text(" ", strip=True))
-                if d:
-                    return d, f"K-Vote ({nm})"
 
-        # 테이블 없이 전체 텍스트 스캔 (회사명 찾은 뒤 근처 날짜)
-        full_text = soup.get_text(" ", strip=True)
-        idx = full_text.find(company_name)
-        if idx >= 0:
-            nearby = full_text[max(0, idx - 20): idx + 100]
-            d = _extract_date(nearby)
-            if d:
-                return d, f"K-Vote (텍스트 파싱)"
-
-    except requests.exceptions.ConnectionError:
-        return None, "K-Vote: 네트워크 오류"
-    except Exception as e:
-        pass
-
-    # ── 시도 2: 전체 목록 GET (페이지 파싱 방식) ──
+    # ── 방법 B: GET 방식 ──
     try:
-        r2 = sess.get(
+        r = sess.get(
             BASE + "/evote/main/agm/agmScheduleList.do",
-            params={
-                "srchCrpNm": company_name,
-                "agmSchdSrchYr": "2026",
-            },
+            params={"srchCrpNm": company_name, "agmSchdSrchYr": "2026"},
             timeout=15,
         )
-        r2.raise_for_status()
-        soup2 = BeautifulSoup(r2.text, "html.parser")
-
-        # li, div 등에서 회사명·날짜 조합 탐색
-        for tag in soup2.find_all(["li", "div", "tr", "article"]):
-            text = tag.get_text(" ", strip=True)
-            if _corp_name_match(company_name, text[:50]):
-                d = _extract_date(text)
-                if d:
-                    return d, f"K-Vote GET ({company_name})"
-
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup.find_all(["tr", "li", "div"]):
+                text = tag.get_text(" ", strip=True)
+                if len(text) < 200 and _corp_match(company_name, text[:60]):
+                    d = _pick_date(text)
+                    if d:
+                        return d, "K-Vote (GET)"
     except Exception:
         pass
 
-    # ── 시도 3: AJAX JSON 엔드포인트 직접 호출 ──
-    ajax_urls = [
-        BASE + "/evote/api/agm/schedule",
-        BASE + "/evote/main/agm/agmScheduleListAjax.do",
-        BASE + "/evote/rest/agm/agmScheduleList",
-    ]
-    for ajax_url in ajax_urls:
-        try:
-            r3 = sess.get(
-                ajax_url,
-                params={"crpNm": company_name, "year": "2026"},
-                timeout=10,
-            )
-            if r3.status_code == 200:
-                jd = r3.json()
-                for list_key in ("list", "data", "result", "items"):
-                    for item in jd.get(list_key, []):
-                        nm = str(item.get("crpNm") or item.get("corpNm") or "")
-                        dt = str(item.get("agmDt") or item.get("agmOpenDt") or "")
-                        if _corp_name_match(company_name, nm):
-                            d = _extract_date(dt)
-                            if d:
-                                return d, f"K-Vote API ({nm})"
-        except Exception:
-            continue
-
-    return None, "K-Vote: 일정 없음 (공시 전이거나 비전자투표 기업일 수 있음)"
-
+    return None, "K-Vote: 일정 없음"
 
 
 # ─────────────────────────────────────────────
+# ③ Claude AI 웹 검색 (Anthropic API + web_search)
+# ─────────────────────────────────────────────
+
+def search_via_claude(company_name: str, anthropic_key: str) -> tuple[str | None, str]:
+    """
+    Anthropic API에 web_search 툴을 붙여서 주주총회 일자를 검색.
+    채팅에서 Claude에게 묻는 것과 동일한 방식.
+    """
+    if not anthropic_key:
+        return None, "Anthropic API 키 없음"
+
+    prompt = (
+        f"{company_name}의 2026년 정기주주총회 날짜가 언제인지 알려줘. "
+        "DART 공시, K-Vote, 증권사 일정 등을 검색해서 확인해줘. "
+        "날짜만 'YYYY-MM-DD' 형식으로 딱 한 줄로 답해줘. "
+        "모르면 'UNKNOWN'이라고만 답해."
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": anthropic_key,
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "web-search-2025-03-05",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 256,
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=40,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # content 블록에서 텍스트 추출
+        answer = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                answer += block.get("text", "")
+
+        answer = answer.strip()
+        if "UNKNOWN" in answer.upper() or not answer:
+            return None, "AI 검색: 확인 불가"
+
+        # YYYY-MM-DD 추출
+        m = re.search(r"2026-03-(\d{2})", answer)
+        if m:
+            d = f"2026-03-{m.group(1)}"
+            if validate_march_2026(d):
+                return d, f"AI 웹검색 ({answer[:60].strip()})"
+
+        # "3월 XX일" 형태도 처리
+        d = _pick_date(answer)
+        if d:
+            return d, f"AI 웹검색 ({answer[:60].strip()})"
+
+        return None, f"AI 검색: 날짜 파싱 실패 ({answer[:40]})"
+
+    except requests.exceptions.ConnectionError:
+        return None, "AI 검색: 네트워크 오류"
+    except Exception as e:
+        return None, f"AI 검색 오류: {str(e)[:50]}"
+
+
+# ─────────────────────────────────────────────
+# ④ 교차검증 통합 검색
+# ─────────────────────────────────────────────
+
+def search_agm_date(
+    company_name: str,
+    dart_key: str,
+    anthropic_key: str = "",
+) -> tuple[str | None, str, dict]:
+    """
+    DART → K-Vote → Claude AI 웹검색 순으로 조회 후 교차검증.
+    Returns: (확정날짜 | None, 상태메시지, 상세결과dict)
+    """
+    detail = {
+        "dart":  (None, ""),
+        "kvote": (None, ""),
+        "ai":    (None, ""),
+    }
+
+    # ① DART (API 키 있을 때만)
+    dart_date, dart_src = (
+        search_dart_api(company_name, dart_key)
+        if dart_key else (None, "DART API 키 없음")
+    )
+    detail["dart"] = (dart_date, dart_src)
+
+    # ② K-Vote
+    kvote_date, kvote_src = search_kvote(company_name)
+    detail["kvote"] = (kvote_date, kvote_src)
+
+    # ③ AI 웹검색 (키 있을 때만, 앞 두 결과가 없을 때)
+    dart_ok  = validate_march_2026(dart_date)
+    kvote_ok = validate_march_2026(kvote_date)
+    ai_date = ai_src = None
+
+    if anthropic_key and not (dart_ok and kvote_ok):
+        ai_date, ai_src = search_via_claude(company_name, anthropic_key)
+        detail["ai"] = (ai_date, ai_src)
+
+    ai_ok = validate_march_2026(ai_date)
+
+    # ── 판정 ──
+    dates_found = [d for d in [dart_date, kvote_date, ai_date]
+                   if validate_march_2026(d)]
+    sources_found = []
+    if dart_ok:  sources_found.append("DART")
+    if kvote_ok: sources_found.append("K-Vote")
+    if ai_ok:    sources_found.append("AI검색")
+
+    if len(dates_found) == 0:
+        msgs = [s for s in [dart_src, kvote_src, ai_src] if s]
+        return None, " / ".join(msgs[:2]) or "조회 실패", detail
+
+    # 다수결: 가장 많이 나온 날짜
+    from collections import Counter
+    winner = Counter(dates_found).most_common(1)[0][0]
+
+    if len(set(dates_found)) == 1:
+        label = "✅ 확인 (" + "·".join(sources_found) + " 일치)"
+    elif len(dates_found) >= 2 and Counter(dates_found)[winner] >= 2:
+        label = f"✅ 교차확인 ({winner}, " + "·".join(sources_found) + ")"
+    else:
+        label = "🟡 단독확인 (" + sources_found[0] + ")"
+        if len(set(dates_found)) > 1:
+            label += f" ⚠️ 불일치: {dates_found}"
+
+    return winner, label, detail
+
 # ③ 교차검증 통합 검색
 # ─────────────────────────────────────────────
 
@@ -732,15 +822,15 @@ def render_calendar_html(year: int, month: int, day_map: dict) -> str:
 # 사이드바
 # ─────────────────────────────────────────────
 
-def render_sidebar(state: dict) -> str:
+def render_sidebar(state: dict) -> tuple[str, str]:
     st.sidebar.title("⚙️ 설정")
 
+    # ── DART API 키 ──
     dart_api_key = st.sidebar.text_input(
-        "DART OpenAPI 키",
+        "① DART OpenAPI 키 (선택)",
         type="password",
-        help="opendart.fss.or.kr 무료 발급",
+        help="opendart.fss.or.kr 무료 발급 — 없어도 K-Vote·AI 검색 가능",
     )
-
     if dart_api_key:
         if os.path.exists(CORP_CACHE):
             age_h = (time.time() - os.path.getmtime(CORP_CACHE)) / 3600
@@ -755,81 +845,83 @@ def render_sidebar(state: dict) -> str:
                         st.sidebar.error(str(e))
         else:
             st.sidebar.caption("⚠️ 첫 검색 시 자동 다운로드")
+
+    # ── Anthropic API 키 (AI 웹검색용) ──
+    st.sidebar.markdown("")
+    anthropic_key = st.sidebar.text_input(
+        "② Anthropic API 키 (AI 웹검색용, 선택)",
+        type="password",
+        help="Claude가 웹 검색으로 주총일을 직접 찾습니다. console.anthropic.com에서 발급",
+    )
+    if anthropic_key:
+        st.sidebar.caption("✅ AI 웹검색 활성화 — DART·K-Vote 실패 시 자동 사용")
     else:
-        st.sidebar.info("API 키 입력 후 DART 검색 가능")
+        st.sidebar.caption("💡 Anthropic 키 입력 시 웹검색으로 보완 가능")
 
     st.sidebar.markdown("---")
 
-    if st.sidebar.button("🔍 전체 교차검증 검색", use_container_width=True):
-        df = load_excel_data()
-        if dart_api_key:
+    def _run_search(corps, df, use_dart, use_anthropic, label):
+        if use_dart and dart_api_key:
             try:
                 with st.spinner("기업코드 로딩…"):
                     load_corp_codes(dart_api_key)
             except Exception as e:
                 st.sidebar.error(str(e))
-                return dart_api_key
-
-        prog  = st.sidebar.progress(0)
-        results = {}
-        corps = df["단체명"].tolist()
-        for i, corp in enumerate(corps):
-            found, status, detail = search_agm_date(corp, dart_api_key)
-            results[corp] = {"date": found, "source": status, "detail": detail}
-            prog.progress((i + 1) / len(corps), text=f"{corp}…")
-            time.sleep(0.5)
-        prog.empty()
-        st.session_state["crawl_results"] = results
-
-        updated_n = 0
-        for corp, info in results.items():
-            if info["date"]:
-                r = df[df["단체명"] == corp]
-                if not r.empty:
-                    cur = state["overrides"].get(corp, r.iloc[0]["주주총회일"])
-                    if info["date"] != cur:
-                        state["overrides"][corp] = info["date"]
-                        state.setdefault("updated_recently", set()).add(corp)
-                        state.setdefault("updated_timestamps", {})[corp] = datetime.now().isoformat()
-                        updated_n += 1
-        save_state(state)
-        msg = f"✅ {updated_n}개 업데이트됨" if updated_n else "변경 없음"
-        st.sidebar.success(msg)
-        st.rerun()
-
-    # K-Vote 단독 검색 (API 키 불필요)
-    if st.sidebar.button("📋 K-Vote 전체 검색 (API 키 불필요)", use_container_width=True):
-        df = load_excel_data()
-        prog  = st.sidebar.progress(0)
+                return
+        prog = st.sidebar.progress(0)
         results = st.session_state.get("crawl_results", {})
-        corps = df["단체명"].tolist()
         updated_n = 0
         for i, corp in enumerate(corps):
-            kvote_date, kvote_src = search_kvote(corp)
             prog.progress((i + 1) / len(corps), text=f"{corp}…")
-            # 기존 결과에 K-Vote 결과 병합
+            if label == "kvote":
+                found, src = search_kvote(corp)
+                detail_update = {"kvote": (found, src)}
+                ai_d = ai_s = None
+            elif label == "ai":
+                found, src = search_via_claude(corp, anthropic_key)
+                detail_update = {"ai": (found, src)}
+                ai_d, ai_s = found, src
+            else:  # full
+                found, src, detail_update = search_agm_date(
+                    corp, dart_api_key if use_dart else "",
+                    anthropic_key if use_anthropic else "")
+
             existing = results.get(corp, {"date": None, "source": "", "detail": {}})
-            existing.setdefault("detail", {})["kvote"] = (kvote_date, kvote_src)
-            if validate_march_2026(kvote_date):
-                existing["date"] = existing.get("date") or kvote_date
-                existing["source"] = existing.get("source") or f"K-Vote ({kvote_src})"
-                # 날짜 업데이트
-                r = df[df["단체명"] == corp]
-                if not r.empty:
-                    cur = state["overrides"].get(corp, r.iloc[0]["주주총회일"])
-                    if kvote_date != cur:
-                        state["overrides"][corp] = kvote_date
-                        state.setdefault("updated_recently", set()).add(corp)
-                        state.setdefault("updated_timestamps", {})[corp] = datetime.now().isoformat()
-                        updated_n += 1
+            existing["detail"] = {**existing.get("detail", {}), **detail_update}
+            if validate_march_2026(found):
+                cur = state["overrides"].get(
+                    corp, df[df["단체명"] == corp].iloc[0]["주주총회일"]
+                    if not df[df["단체명"] == corp].empty else "")
+                if found != cur:
+                    state["overrides"][corp] = found
+                    state.setdefault("updated_recently", set()).add(corp)
+                    state.setdefault("updated_timestamps", {})[corp] = datetime.now().isoformat()
+                    updated_n += 1
+                existing["date"] = existing.get("date") or found
+                existing["source"] = src
             results[corp] = existing
-            time.sleep(0.3)
+            time.sleep(0.4)
         prog.empty()
         st.session_state["crawl_results"] = results
         save_state(state)
-        msg = f"✅ {updated_n}개 업데이트됨" if updated_n else "변경 없음"
-        st.sidebar.success(msg)
+        st.sidebar.success(f"✅ {updated_n}개 업데이트됨" if updated_n else "변경 없음")
         st.rerun()
+
+    df = load_excel_data()
+    corps = df["단체명"].tolist()
+
+    # 버튼 1: 전체 교차검증 (DART + K-Vote + AI)
+    if st.sidebar.button("🔍 전체 교차검증", use_container_width=True, type="primary"):
+        _run_search(corps, df, bool(dart_api_key), bool(anthropic_key), "full")
+
+    # 버튼 2: K-Vote만
+    if st.sidebar.button("📋 K-Vote만 검색", use_container_width=True):
+        _run_search(corps, df, False, False, "kvote")
+
+    # 버튼 3: AI 웹검색만 (Anthropic 키 필요)
+    if st.sidebar.button("🤖 AI 웹검색만", use_container_width=True,
+                          disabled=not anthropic_key):
+        _run_search(corps, df, False, True, "ai")
 
     st.sidebar.markdown("---")
 
@@ -847,24 +939,29 @@ def render_sidebar(state: dict) -> str:
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("""
-**달력 범례**
+**검색 방법 안내**
 
-🟢 초록 칩 = 확정  
-🔵 파란 칩 = 확정 (필수단체)  
-🟡 노란 칩 = DART 업데이트됨  
-🟠 점선 칩 = 미정 (작년 날짜 기준)  
-★ = 필수단체  
-* = 미정 표시
+| 방법 | 키 필요 | 속도 |
+|---|---|---|
+| DART API | ✅ | 빠름 |
+| K-Vote | ❌ | 보통 |
+| AI 웹검색 | ✅ Anthropic | 느림·정확 |
+
+**달력 범례**  
+🟢 초록 = 확정 &nbsp; 🔵 파랑 = 확정+필수  
+🟡 노랑 = 업데이트됨 &nbsp; 🟠 점선 = 미정  
+★ = 필수단체 &nbsp; * = 미정
 """)
 
-    return dart_api_key
+    return dart_api_key, anthropic_key
+
 
 
 # ─────────────────────────────────────────────
 # 리스트 뷰
 # ─────────────────────────────────────────────
 
-def render_list_view(df: pd.DataFrame, state: dict, dart_api_key: str):
+def render_list_view(df: pd.DataFrame, state: dict, dart_api_key: str, anthropic_key: str = ""):
     overrides        = state["overrides"]
     changes          = state.get("changes", {})
     updated_recently = state.get("updated_recently", set())
@@ -922,7 +1019,7 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_api_key: str):
             with c3:
                 if st.button("🔍 교차검증", key=f"dart_{company}"):
                     with st.spinner(f"{company} 조회 중…"):
-                        found, status, detail = search_agm_date(company, dart_api_key)
+                        found, status, detail = search_agm_date(company, dart_api_key, anthropic_key)
                         crawl_results[company] = {
                             "date": found, "source": status, "detail": detail}
                         st.session_state["crawl_results"] = crawl_results
@@ -1027,7 +1124,7 @@ def render_change_modal(state: dict):
 def main():
     init_session()
     state = st.session_state["state"]
-    dart_api_key = render_sidebar(state)
+    dart_api_key, anthropic_key = render_sidebar(state)
 
     # 헤더
     col_t, col_v = st.columns([5, 2])
@@ -1079,7 +1176,7 @@ def main():
                     unsafe_allow_html=True)
 
     else:
-        render_list_view(df, state, dart_api_key)
+        render_list_view(df, state, dart_api_key, anthropic_key)
 
 
 if __name__ == "__main__":
