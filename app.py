@@ -73,13 +73,18 @@ def load_state() -> dict:
         try:
             raw = json.load(open(STATE_PATH, encoding="utf-8"))
             raw["updated_recently"] = set(raw.get("updated_recently", []))
+            # change_history 없으면 changes 에서 마이그레이션
+            if "change_history" not in raw:
+                ch = {}
+                for k, v in raw.get("changes", {}).items():
+                    ch[k] = v if isinstance(v, list) else [v]
+                raw["change_history"] = ch
             return raw
         except Exception:
             pass
-    return {"overrides":{}, "changes":{}, "updated_recently":set(),
-            
-            "updated_timestamps":{}, "name_replacements":{},
-            "agenda_status":{}, "done_status":{}}
+    return {"overrides":{}, "changes":{}, "change_history":{},
+            "updated_recently":set(), "updated_timestamps":{},
+            "name_replacements":{}, "agenda_status":{}, "done_status":{}}
 
 
 def save_state(state: dict):
@@ -90,12 +95,14 @@ def save_state(state: dict):
 
 def init_session():
     for k, v in [
-        ("state",         load_state()),
-        ("inline_change", None),   # 기업변경 인라인: company name
-        ("inline_manual", None),   # 수동날짜입력 인라인: company name
-        ("expanded_prev", set()),
-        ("crawl_results", {}),
-        ("search_log",    None),
+        ("state",               load_state()),
+        ("inline_change",       None),
+        ("inline_manual",       None),
+        ("crawl_results",       {}),
+        ("pending_updates",     {}),
+        ("apply_selected",      set()),
+        ("change_history_open", set()),
+        ("search_log",          None),
     ]:
         if k not in st.session_state:
             st.session_state[k] = v
@@ -362,11 +369,12 @@ def _pending_only(df, state) -> pd.DataFrame:
 
 
 def _run_bulk_search(df, state, search_fn, label, delay=1.5):
-    """공통 전체검색 루프. search_fn(corp) -> (date|None, source)"""
+    """공통 전체검색 루프 — 결과를 pending_updates에 저장 (미적용 상태)"""
     corps    = df["단체명"].tolist()
     total    = len(corps)
     prog     = st.sidebar.progress(0)
     results  = st.session_state.get("crawl_results", {})
+    pending  = st.session_state.get("pending_updates", {})
     upd_list = []; unc_list = []; nor_list = []
 
     for i, corp in enumerate(corps):
@@ -379,9 +387,7 @@ def _run_bulk_search(df, state, search_fn, label, delay=1.5):
             cur = state["overrides"].get(
                 corp, r_row.iloc[0]["주주총회일"] if not r_row.empty else "")
             if found != cur:
-                state["overrides"][corp] = found
-                state.setdefault("updated_recently", set()).add(corp)
-                state.setdefault("updated_timestamps", {})[corp] = datetime.now().isoformat()
+                pending[corp] = {"new_date": found, "source": src, "prev_date": cur}
                 upd_list.append((corp, cur, found, src))
             else:
                 unc_list.append((corp, found))
@@ -391,6 +397,7 @@ def _run_bulk_search(df, state, search_fn, label, delay=1.5):
 
     prog.empty()
     st.session_state["crawl_results"] = results
+    st.session_state["pending_updates"] = pending
     st.session_state["search_log"] = {
         "label":     label,
         "updated":   upd_list,
@@ -398,7 +405,6 @@ def _run_bulk_search(df, state, search_fn, label, delay=1.5):
         "no_result": nor_list,
         "ran_at":    datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
-    save_state(state)
     st.rerun()
 
 
@@ -484,6 +490,33 @@ def render_sidebar(state: dict):
                         "키 없이는 리스트 탭 ✏️ 날짜입력으로 수동 등록하세요.")
 
     st.sidebar.markdown("---")
+
+    # ── 업데이트 사항 전체 적용 ──
+    pending  = st.session_state.get("pending_updates", {})
+    selected = st.session_state.get("apply_selected", set())
+    to_apply = [c for c in selected if c in pending]
+    if to_apply:
+        st.sidebar.caption(f"✅ 체크된 항목: {len(to_apply)}개 / 미적용 {len(pending)}개")
+        if st.sidebar.button(f"✅ 업데이트 사항 전체 적용 ({len(to_apply)}개)",
+                             use_container_width=True, type="primary"):
+            for corp in to_apply:
+                new_d = pending[corp]["new_date"]
+                if validate_march_2026(new_d):
+                    state["overrides"][corp] = new_d
+                    state.setdefault("updated_recently", set()).add(corp)
+                    state.setdefault("updated_timestamps", {})[corp] = datetime.now().isoformat()
+            # 적용된 항목을 pending에서 제거
+            for corp in to_apply:
+                pending.pop(corp, None)
+                selected.discard(corp)
+            st.session_state["pending_updates"] = pending
+            st.session_state["apply_selected"]  = selected
+            save_state(state)
+            st.sidebar.success(f"{len(to_apply)}개 적용 완료!")
+            st.rerun()
+    elif pending:
+        st.sidebar.caption(f"⏳ 미적용 항목: {len(pending)}개 (리스트에서 체크하세요)")
+
     if st.sidebar.button("🗑️ 업데이트 표시 초기화", use_container_width=True):
         state["updated_recently"] = set(); save_state(state); st.rerun()
     if st.sidebar.button("⚠️ 전체 초기화", use_container_width=True, type="secondary"):
@@ -536,72 +569,107 @@ def render_search_log():
 
 # ── 리스트 뷰 ─────────────────────────────────
 
-# 컬럼 너비 비율
-_COL_W = [3.2, 2.2, 1.2, 1.5, 1.5, 1.8, 1.8]
-
-def _list_header():
-    """7열 헤더 행"""
-    cols = st.columns(_COL_W)
-    headers = ["정기주총 의결권행사기업", "주총일자", "날짜\n체크", "날짜입력", "기업변경",
-               "의안분석\n현황", "진행완료\n여부"]
-    header_css = ("background:#f1f5f9;font-weight:700;font-size:.8em;color:#374151;"
-                  "padding:6px 4px;border-bottom:2px solid #cbd5e1;text-align:center;")
-    for col, h in zip(cols, headers):
-        with col:
-            st.markdown(f'<div style="{header_css}">{h}</div>', unsafe_allow_html=True)
+_COL_W = [3.5, 2.2, 1.4, 1.4, 1.4, 1.6, 1.6]
 
 
 def _sort_key(row):
-    """주총일자 오름차순, 미정은 맨 뒤, 동일 날짜 내 가나다 순"""
     disp = row["_disp"]
     if is_confirmed(disp):
         return (0, disp, row["단체명"])
-    else:
-        est = extract_pending_date(disp) or "9999-12-31"
-        return (1, est, row["단체명"])
+    est = extract_pending_date(disp) or "9999-12-31"
+    return (1, est, row["단체명"])
+
+
+def _apply_company_change(state, old_name, new_name, new_date, orig_date):
+    """기업변경 처리 + change_history 기록"""
+    ch = state.setdefault("change_history", {})
+    prev_entry = {
+        "prev_name":  old_name,
+        "prev_date":  state["overrides"].get(old_name, orig_date),
+        "changed_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    # 기존 히스토리 이어받기
+    existing = ch.get(old_name, [])
+    ch[new_name] = existing + [prev_entry]
+    ch.pop(old_name, None)
+
+    state["overrides"].pop(old_name, None)
+    state["overrides"][new_name] = new_date
+    state.setdefault("name_replacements", {})[old_name] = new_name
+    # 구형 changes 도 호환용으로 유지
+    state.setdefault("changes", {})[new_name] = prev_entry
 
 
 def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key: str = ""):
     overrides        = state["overrides"]
-    changes          = state.get("changes", {})
+    change_history   = state.setdefault("change_history", {})
     updated_recently = state.get("updated_recently", set())
     agenda_status    = state.setdefault("agenda_status", {})
     done_status      = state.setdefault("done_status", {})
-    crawl            = st.session_state.get("crawl_results", {})
+    pending          = st.session_state.setdefault("pending_updates", {})
+    apply_sel        = st.session_state.setdefault("apply_selected", set())
 
     df = df.copy()
     df["_disp"] = df.apply(lambda r: overrides.get(r["단체명"], r["주주총회일"]), axis=1)
     df["_conf"] = df["_disp"].apply(is_confirmed)
-
-    # 정렬
     df["_sort"] = df.apply(_sort_key, axis=1)
     df = df.sort_values("_sort").reset_index(drop=True)
 
-    total_conf = df["_conf"].sum()
-    total_pend = (~df["_conf"]).sum()
-    st.markdown(
-        f'<span style="font-size:.9em;color:#6b7280">총 {len(df)}개 │ '
-        f'<span style="color:#166534">확정 {total_conf}개</span> │ '
-        f'<span style="color:#9a3412">미정 {total_pend}개</span></span>',
-        unsafe_allow_html=True)
-    st.markdown("")
+    total_conf = int(df["_conf"].sum())
+    total_pend = len(df) - total_conf
+    pend_cnt   = len(pending)
 
-    _list_header()
+    # ── 요약 + 전체선택 버튼 행 ──
+    sc1, sc2, sc3 = st.columns([6, 2, 2])
+    with sc1:
+        st.markdown(
+            f'<span style="font-size:.9em;color:#6b7280">총 {len(df)}개 │ '
+            f'<span style="color:#166534">확정 {total_conf}개</span> │ '
+            f'<span style="color:#9a3412">미정 {total_pend}개</span>'
+            + (f' │ <span style="color:#d97706">미적용 {pend_cnt}개</span>' if pend_cnt else "")
+            + "</span>",
+            unsafe_allow_html=True)
+    with sc2:
+        if pend_cnt:
+            if st.button(f"☑ 전체선택 ({pend_cnt})", use_container_width=True):
+                st.session_state["apply_selected"] = set(pending.keys())
+                st.rerun()
+    with sc3:
+        if apply_sel:
+            if st.button(f"☐ 선택해제", use_container_width=True):
+                st.session_state["apply_selected"] = set()
+                st.rerun()
 
+    # ── 헤더 ──
+    hcols = st.columns(_COL_W)
+    headers = ["정기주총 의결권행사기업", "주총일자", "날짜체크", "날짜입력", "기업변경",
+               "의안분석\n현황", "진행완료\n여부"]
+    hcss = ("background:#1e3a5f;color:#fff;font-weight:700;font-size:.78em;"
+            "padding:6px 4px;text-align:center;border-radius:3px;")
+    for col, h in zip(hcols, headers):
+        with col:
+            st.markdown(f'<div style="{hcss}">{h}</div>', unsafe_allow_html=True)
+
+    # ── 행 렌더링 ──
     for _, row in df.iterrows():
         company  = row["단체명"]
         orig     = row["주주총회일"]
         disp     = overrides.get(company, orig)
         required = row["비고"] == "필수단체"
         updated  = company in updated_recently
-        has_prev = company in changes
+        hist     = change_history.get(company, [])
+        hist_n   = len(hist)
+        hist_open = company in st.session_state["change_history_open"]
+        has_pending = company in pending
 
-        confirmed = is_confirmed(disp)
-        agenda_on = agenda_status.get(company, False)
-        done_on   = done_status.get(company, False)
+        confirmed  = is_confirmed(disp)
+        agenda_on  = agenda_status.get(company, False)
+        done_on    = done_status.get(company, False)
 
-        # 행 구분선
-        st.markdown('<hr style="margin:2px 0;border:none;border-top:1px solid #e2e8f0">', unsafe_allow_html=True)
+        # 얇은 구분선
+        st.markdown(
+            '<hr style="margin:1px 0;border:none;border-top:1px solid #e2e8f0">',
+            unsafe_allow_html=True)
 
         cols = st.columns(_COL_W)
 
@@ -609,32 +677,53 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
         with cols[0]:
             req_sfx  = " 🔴" if required else ""
             upd_html = ' <span class="updated-badge">🔄</span>' if updated else ""
-            name_style = "font-weight:600;font-size:.9em;"
-            if has_prev:
-                exp = company in st.session_state["expanded_prev"]
-                if st.button(f"{'▼' if exp else '▶'} {company}{req_sfx}",
-                             key=f"exp_{company}", use_container_width=True):
-                    if exp: st.session_state["expanded_prev"].discard(company)
-                    else:   st.session_state["expanded_prev"].add(company)
+
+            # 기업명 표시 (항상 텍스트)
+            st.markdown(
+                f'<div style="font-weight:600;font-size:.88em;line-height:1.4">'
+                f'{company}{req_sfx}{upd_html}</div>',
+                unsafe_allow_html=True)
+
+            # N회 변경 링크 버튼
+            if hist_n:
+                label = f"{'▼' if hist_open else '▶'} {hist_n}회 변경"
+                if st.button(label, key=f"hist_{company}",
+                             help="변경 히스토리 보기"):
+                    if hist_open:
+                        st.session_state["change_history_open"].discard(company)
+                    else:
+                        st.session_state["change_history_open"].add(company)
                     st.rerun()
-            else:
-                st.markdown(
-                    f'<div style="{name_style}">{company}{req_sfx}{upd_html}</div>',
-                    unsafe_allow_html=True)
+
+            # [업데이트 적용] 체크박스
+            if has_pending:
+                pd_info = pending[company]
+                is_checked = company in apply_sel
+                new_check = st.checkbox(
+                    f"업데이트 적용 → {pd_info['new_date'][5:]}",
+                    value=is_checked,
+                    key=f"apply_{company}")
+                if new_check != is_checked:
+                    if new_check: apply_sel.add(company)
+                    else: apply_sel.discard(company)
+                    st.session_state["apply_selected"] = apply_sel
+                    st.rerun()
 
         # ── 열2: 날짜 ──
         with cols[1]:
             if confirmed:
-                st.markdown(f'<span class="date-conf" style="font-size:.9em">{disp}</span>',
-                            unsafe_allow_html=True)
+                st.markdown(
+                    f'<span class="date-conf" style="font-size:.88em">{disp}</span>',
+                    unsafe_allow_html=True)
             else:
                 est = extract_pending_date(orig)
-                est_txt = f"<br><span style='font-size:.78em;color:#6b7280'>예상 {est}</span>" if est else ""
+                est_txt = (f"<br><span style='font-size:.75em;color:#6b7280'>예상 {est}</span>"
+                           if est else "")
                 st.markdown(
-                    f'<span class="date-pend" style="font-size:.88em">{disp}</span>{est_txt}',
+                    f'<span class="date-pend" style="font-size:.85em">{disp}</span>{est_txt}',
                     unsafe_allow_html=True)
 
-        # ── 열3: 날짜 체크 (개별 검색) ──
+        # ── 열3: 날짜체크 (검색 → pending) ──
         with cols[2]:
             can_search = anthropic_key or dart_key
             if can_search:
@@ -645,30 +734,37 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                             found, src = search_via_claude(company, anthropic_key)
                         else:
                             found, src = search_dart_api(company, dart_key)
-                        crawl[company] = {"date": found, "source": src}
-                        st.session_state["crawl_results"] = crawl
-                        if validate_march_2026(found) and found != disp:
-                            state["overrides"][company] = found
-                            state.setdefault("updated_recently", set()).add(company)
-                            state.setdefault("updated_timestamps", {})[company] = datetime.now().isoformat()
-                            save_state(state)
-                            st.rerun()
-            if company in crawl:
-                fd = crawl[company].get("date")
-                if validate_march_2026(fd) and fd != disp:
-                    st.markdown(f'<span class="src-ok" style="font-size:.8em">→{fd[5:]}</span>',
-                                unsafe_allow_html=True)
-                elif validate_march_2026(fd):
-                    st.markdown('<span class="src-same">✓</span>', unsafe_allow_html=True)
-                else:
-                    st.markdown(f'<span class="src-err" style="font-size:.8em">✗</span>',
-                                unsafe_allow_html=True)
+                    cr = st.session_state.get("crawl_results", {})
+                    cr[company] = {"date": found, "source": src}
+                    st.session_state["crawl_results"] = cr
+                    if validate_march_2026(found) and found != disp:
+                        pending[company] = {"new_date": found, "source": src, "prev_date": disp}
+                        st.session_state["pending_updates"] = pending
+                    st.rerun()
+
+            # 검색된 날짜를 초록 글자로 표시
+            if company in pending:
+                nd = pending[company]["new_date"]
+                st.markdown(
+                    f'<span style="color:#166534;font-weight:700;font-size:.85em">→ {nd[5:]}</span>',
+                    unsafe_allow_html=True)
+            else:
+                cr = st.session_state.get("crawl_results", {})
+                if company in cr:
+                    fd = cr[company].get("date")
+                    if validate_march_2026(fd) and fd == disp:
+                        st.markdown('<span class="src-same" style="font-size:.8em">✓ 동일</span>',
+                                    unsafe_allow_html=True)
+                    elif not validate_march_2026(fd):
+                        st.markdown('<span class="src-err" style="font-size:.8em">✗ 미발견</span>',
+                                    unsafe_allow_html=True)
 
         # ── 열4: 날짜입력 ──
         with cols[3]:
             manual_active = st.session_state.get("inline_manual") == company
-            if st.button("✖ 닫기" if manual_active else "✏️ 입력",
-                         key=f"man_{company}", use_container_width=True):
+            if st.button("✖" if manual_active else "✏️", key=f"man_{company}",
+                         use_container_width=True,
+                         help="닫기" if manual_active else "날짜 직접 입력"):
                 st.session_state["inline_manual"] = None if manual_active else company
                 st.session_state["inline_change"]  = None
                 st.rerun()
@@ -676,39 +772,37 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
         # ── 열5: 기업변경 ──
         with cols[4]:
             change_active = st.session_state.get("inline_change") == company
-            if st.button("✖ 취소" if change_active else "🔄 변경",
-                         key=f"chg_{company}", use_container_width=True):
+            if st.button("✖" if change_active else "🔄", key=f"chg_{company}",
+                         use_container_width=True,
+                         help="취소" if change_active else "기업 교체"):
                 st.session_state["inline_change"]  = None if change_active else company
                 st.session_state["inline_manual"]  = None
                 st.rerun()
 
         # ── 열6: 의안분석 현황 ──
         with cols[5]:
-            agenda_label = "🟢 O" if agenda_on else "　 —"
-            if st.button(agenda_label, key=f"agenda_{company}", use_container_width=True,
-                         help="클릭하여 의안분석 현황 토글"):
+            lbl = "🟢 O" if agenda_on else "—"
+            if st.button(lbl, key=f"agenda_{company}", use_container_width=True,
+                         help="의안분석 현황 토글"):
                 agenda_status[company] = not agenda_on
-                save_state(state)
-                st.rerun()
+                save_state(state); st.rerun()
 
         # ── 열7: 진행완료 여부 ──
         with cols[6]:
-            done_label = "✅ O" if done_on else "　 —"
-            if st.button(done_label, key=f"done_{company}", use_container_width=True,
-                         help="클릭하여 진행완료 여부 토글"):
+            lbl = "✅ O" if done_on else "—"
+            if st.button(lbl, key=f"done_{company}", use_container_width=True,
+                         help="진행완료 여부 토글"):
                 done_status[company] = not done_on
-                save_state(state)
-                st.rerun()
+                save_state(state); st.rerun()
 
-        # ── 이전 기업 정보 ──
-        if has_prev and company in st.session_state["expanded_prev"]:
-            prev = changes[company]
-            st.markdown(
-                f'<div style="background:#f1f5f9;border-left:4px solid #94a3b8;'
-                f'padding:7px 14px;margin:2px 0;font-size:.83em;color:#475569;">'
-                f'🔁 <b>변경 전</b>: {prev["prev_name"]} │ '
-                f'날짜: {prev["prev_date"]} │ {prev["changed_at"]}</div>',
-                unsafe_allow_html=True)
+        # ── 변경 히스토리 ──
+        if hist_n and hist_open:
+            for entry in reversed(hist):
+                st.markdown(
+                    f'<div style="background:#f1f5f9;border-left:3px solid #94a3b8;'
+                    f'padding:4px 12px;margin:1px 0;font-size:.8em;color:#475569;">'
+                    f'🔁 <b>{entry["prev_name"]}</b> │ 날짜: {entry["prev_date"]} │ {entry["changed_at"]}</div>',
+                    unsafe_allow_html=True)
 
         # ── 수동 날짜 입력 폼 ──
         if st.session_state.get("inline_manual") == company:
@@ -733,6 +827,10 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                     state["overrides"][company] = new_d
                     state.setdefault("updated_recently", set()).add(company)
                     state.setdefault("updated_timestamps", {})[company] = datetime.now().isoformat()
+                    # pending에서 제거 (수동으로 처리했으므로)
+                    pending.pop(company, None)
+                    apply_sel.discard(company)
+                    st.session_state["pending_updates"] = pending
                     save_state(state)
                     st.session_state["inline_manual"] = None
                     st.rerun()
@@ -741,8 +839,7 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
         # ── 기업변경 폼 ──
         if st.session_state.get("inline_change") == company:
             st.markdown('<div class="change-box">', unsafe_allow_html=True)
-            st.markdown(f"🔄 **{company}** → 다른 기업으로 교체  "
-                        f"_(기존 기업은 '변경 전'으로 기록)_")
+            st.markdown(f"🔄 **{company}** → 다른 기업으로 교체")
             ic1, ic2 = st.columns([3, 2])
             with ic1:
                 new_name = st.text_input("새 기업명", key=f"ic_nm_{company}",
@@ -763,14 +860,7 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                              use_container_width=True, key=f"ic_ok_{company}"):
                     nn = (new_name or "").strip()
                     if nn:
-                        state.setdefault("changes", {})[nn] = {
-                            "prev_name": company,
-                            "prev_date": state["overrides"].get(company, orig),
-                            "changed_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        }
-                        state["overrides"].pop(company, None)
-                        state["overrides"][nn] = new_date
-                        state.setdefault("name_replacements", {})[company] = nn
+                        _apply_company_change(state, company, nn, new_date, orig)
                         save_state(state)
                         load_excel_data.clear()
                         st.session_state["inline_change"] = None
