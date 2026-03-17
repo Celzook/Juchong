@@ -419,9 +419,38 @@ def fetch_dart_agendas(company_name: str, api_key: str) -> tuple[list, str]:
         if target is None:
             return [], "의안 공시 없음"
 
-        doc_html = dart.document(rcept_no)
-        soup     = BeautifulSoup(doc_html, "html.parser")
-        text     = soup.get_text(separator="\n")
+        # ── 문서 원문 가져오기 (OpenDartReader → 직접 API fallback) ──
+        text = None
+        fetch_err = ""
+        try:
+            doc_html = dart.document(rcept_no)
+            soup     = BeautifulSoup(doc_html, "html.parser")
+            text     = soup.get_text(separator="\n")
+        except Exception as e1:
+            fetch_err = str(e1)
+
+        # Fallback: OpenDartReader 실패 시 직접 ZIP 다운로드
+        if text is None:
+            try:
+                r = requests.get(
+                    "https://opendart.fss.or.kr/api/document.xml",
+                    params={"crtfc_key": api_key, "rcept_no": rcept_no},
+                    timeout=20)
+                r.raise_for_status()
+                zf       = zipfile.ZipFile(io.BytesIO(r.content))
+                doc_names = [f for f in zf.namelist()
+                             if f.lower().endswith((".htm",".html",".xml"))]
+                if not doc_names:
+                    doc_names = zf.namelist()
+                raw_html = "".join(
+                    zf.read(n).decode("utf-8", errors="ignore") for n in doc_names)
+                soup = BeautifulSoup(raw_html, "html.parser")
+                text = soup.get_text(separator="\n")
+            except Exception as e2:
+                return [], f"문서오류: {fetch_err[:40]} / {str(e2)[:40]}"
+
+        if not text:
+            return [], f"빈 문서: {fetch_err[:60]}"
 
         raw     = _parse_agendas(text)
         agendas = _group_agendas(raw)
@@ -437,12 +466,12 @@ def fetch_dart_agendas(company_name: str, api_key: str) -> tuple[list, str]:
 
         if agendas:
             return agendas, f"DART ({report_nm[:20]})"
-        return [], f"의안 파싱 실패 ({report_nm[:20]})"
+        return [], f"파싱실패: {report_nm[:20]} (의안 패턴 없음)"
 
-    except requests.exceptions.ConnectionError:
-        return [], "네트워크 오류"
+    except requests.exceptions.ConnectionError as e:
+        return [], f"네트워크 오류: {str(e)[:80]}"
     except Exception as e:
-        return [], f"오류: {str(e)[:60]}"
+        return [], f"오류({type(e).__name__}): {str(e)[:80]}"
 
 def search_via_claude(company_name: str, anthropic_key: str):
     """
