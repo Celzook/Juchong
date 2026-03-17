@@ -109,6 +109,8 @@ def init_session():
         ("pending_updates",     {}),
         ("apply_selected",      set()),
         ("change_history_open", set()),
+        ("agenda_open",         set()),   # 의안 드롭다운 열린 기업
+        ("agenda_cache_mem",    {}),      # 메모리 캐시 {company: [agendas]}
         ("search_log",          None),
     ]:
         if k not in st.session_state:
@@ -221,8 +223,131 @@ def search_dart_api(company_name: str, api_key: str):
         return None, "네트워크 오류"
     except Exception as e:
         return None, f"오류: {str(e)[:50]}"
+
+
+# ── DART 의안 조회 ────────────────────────────
+
+AGENDA_CACHE_PATH = "dart_agenda_cache.json"
+
+
+def _load_agenda_cache() -> dict:
+    if os.path.exists(AGENDA_CACHE_PATH):
+        try:
+            return json.load(open(AGENDA_CACHE_PATH, encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_agenda_cache(cache: dict):
+    json.dump(cache, open(AGENDA_CACHE_PATH, "w", encoding="utf-8"),
+              ensure_ascii=False, indent=2)
+
+
+def _parse_agendas(text: str) -> list:
+    """의결권대리행사권유참고서류 텍스트에서 의안 목록 추출."""
+    agendas = []
+    seen    = set()
+
+    # 패턴 A: "제N호 의안 : 제목" 형태
+    pat_a = re.compile(r'제\s*(\d+)\s*호\s*의안\s*[:\-]?\s*([^\n\r]{3,80})', re.MULTILINE)
+    for m in pat_a.finditer(text):
+        no    = f"제{m.group(1)}호"
+        title = re.sub(r'\s+', ' ', m.group(2)).strip().rstrip('.')
+        if no not in seen and len(title) > 2:
+            agendas.append({"no": no, "title": title})
+            seen.add(no)
+
+    # 패턴 B: "1. 재무제표 승인의 건" 형태
+    if not agendas:
+        pat_b = re.compile(
+            r'^\s*(\d{1,2})\.\s+([가-힣a-zA-Z][^\n\r]{3,80}(?:의\s*건|승인|선임|변경|개정))',
+            re.MULTILINE)
+        for m in pat_b.finditer(text):
+            no    = f"제{m.group(1)}호"
+            title = re.sub(r'\s+', ' ', m.group(2)).strip()
+            if no not in seen and len(title) > 2:
+                agendas.append({"no": no, "title": title})
+                seen.add(no)
+
+    # 결의 종류 감지
+    for item in agendas:
+        pos     = text.find(item["no"])
+        snippet = text[pos:pos+300] if pos >= 0 else ""
+        if "특별결의" in snippet:
+            item["type"] = "특별결의"
+        elif "보통결의" in snippet:
+            item["type"] = "보통결의"
+        else:
+            item["type"] = ""
+
+    return agendas
+
+
+
+def fetch_dart_agendas(company_name: str, api_key: str) -> tuple[list, str]:
+    """
+    의결권대리행사권유참고서류에서 의안 목록 조회.
+    Returns (agendas: list[dict], message: str)
+    """
+    if not api_key:
+        return [], "API 키 없음"
+    if not HAS_ODR:
+        return [], "OpenDartReader 미설치"
+
+    # 캐시 확인
+    cache = _load_agenda_cache()
+    if company_name in cache:
+        cached = cache[company_name]
+        if cached.get("agendas") is not None:
+            return cached["agendas"], f"캐시 ({cached.get('report_nm','')[:20]})"
+
+    try:
+        corp_dict = load_corp_codes(api_key)
+        corp_code = find_corp_code(corp_dict, company_name)
+        if not corp_code:
+            return [], "기업코드 미발견"
+
+        dart   = OpenDartReader(api_key)
+        year   = datetime.now().year
+        reports = dart.list(corp_code, start=f"{year}-01-01", end=f"{year}-03-31")
+
+        if not isinstance(reports, pd.DataFrame) or reports.empty:
+            return [], "공시 없음"
+
+        # 의결권대리행사권유참고서류 우선, 없으면 주주총회소집공고
+        for keyword in ["의결권대리행사권유참고서류", "의결권대리행사권유신고서", "주주총회소집공고"]:
+            mask = reports["report_nm"].str.contains(keyword, na=False)
+            if mask.any():
+                target     = reports[mask].iloc[0]
+                rcept_no   = target["rcept_no"]
+                report_nm  = target["report_nm"]
+                break
+        else:
+            return [], "의안 공시 없음"
+
+        doc_html = dart.document(rcept_no)
+        soup     = BeautifulSoup(doc_html, "html.parser")
+        text     = soup.get_text(separator="\n")
+
+        agendas = _parse_agendas(text)
+
+        # 캐시 저장
+        cache[company_name] = {
+            "agendas":   agendas,
+            "report_nm": report_nm,
+            "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+        _save_agenda_cache(cache)
+
+        if agendas:
+            return agendas, f"DART ({report_nm[:20]})"
+        return [], f"의안 파싱 실패 ({report_nm[:20]})"
+
+    except requests.exceptions.ConnectionError:
+        return [], "네트워크 오류"
     except Exception as e:
-        return None, f"오류: {str(e)[:40]}"
+        return [], f"오류: {str(e)[:60]}"
 
 
 # ── Claude AI 웹검색 ──────────────────────────
@@ -885,12 +1010,33 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
             cols = st.columns(_COL_W)
 
             # 열1: 기업명
+            agenda_open_set = st.session_state["agenda_open"]
+            agenda_open_co  = company in agenda_open_set
             with cols[0]:
                 req_sfx  = " 🔴" if required else ""
                 upd_html = ' <span class="updated-badge">🔄</span>' if updated else ""
                 st.markdown(
                     f'<div style="font-weight:600;font-size:1.0em;line-height:1.4">'
                     f'{company}{req_sfx}{upd_html}</div>', unsafe_allow_html=True)
+
+                # 의안 드롭다운 버튼
+                if dart_key:
+                    agenda_lbl = f"{'▼' if agenda_open_co else '▶'} 의안조회"
+                    if st.button(agenda_lbl, key=f"ag_tog_{company}",
+                                 help="의결권대리행사권유참고서류 의안 조회"):
+                        if agenda_open_co:
+                            agenda_open_set.discard(company)
+                        else:
+                            agenda_open_set.add(company)
+                            # 아직 캐시 없으면 바로 조회
+                            mem_cache = st.session_state["agenda_cache_mem"]
+                            if company not in mem_cache:
+                                with st.spinner(f"{company} 의안 조회 중…"):
+                                    items, msg = fetch_dart_agendas(company, dart_key)
+                                mem_cache[company] = {"items": items, "msg": msg}
+                                st.session_state["agenda_cache_mem"] = mem_cache
+                        st.rerun()
+
                 if hist_n:
                     lbl = f"{'▼' if hist_open else '▶'} {hist_n}회 변경"
                     if st.button(lbl, key=f"hist_{company}", help="변경 히스토리"):
@@ -999,6 +1145,42 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                     state["done_status"][company] = new_val
                     st.session_state["state"]["done_status"][company] = new_val
                     save_state(st.session_state["state"]); st.rerun()
+
+            # 의안 드롭다운
+            if agenda_open_co:
+                mem_cache = st.session_state.get("agenda_cache_mem", {})
+                if company in mem_cache:
+                    ag_data = mem_cache[company]
+                    items   = ag_data["items"]
+                    msg     = ag_data["msg"]
+                    if items:
+                        rows_html = "".join(
+                            f'<tr>'
+                            f'<td style="padding:4px 8px;font-size:.82em;color:#1e3a5f;font-weight:600;white-space:nowrap">{it["no"]}</td>'
+                            f'<td style="padding:4px 8px;font-size:.82em;color:#374151">{it["title"]}</td>'
+                            f'<td style="padding:4px 8px;font-size:.75em;color:#6b7280;white-space:nowrap">{it.get("type","")}</td>'
+                            f'</tr>'
+                            for it in items)
+                        st.markdown(
+                            f'<div style="background:#eef2ff;border-left:3px solid #818cf8;'
+                            f'padding:6px 10px;margin:2px 0;border-radius:4px;">'
+                            f'<div style="font-size:.78em;color:#4338ca;font-weight:700;margin-bottom:4px">'
+                            f'📋 의안 목록 ({len(items)}건) — <span style="font-weight:400">{msg}</span></div>'
+                            f'<table style="width:100%;border-collapse:collapse">'
+                            f'<tr style="background:#c7d2fe"><th style="padding:3px 8px;font-size:.75em;text-align:left">번호</th>'
+                            f'<th style="padding:3px 8px;font-size:.75em;text-align:left">의안명</th>'
+                            f'<th style="padding:3px 8px;font-size:.75em;text-align:left">결의</th></tr>'
+                            f'{rows_html}</table></div>',
+                            unsafe_allow_html=True)
+                    else:
+                        st.markdown(
+                            f'<div style="background:#fef9c3;border-left:3px solid #fde047;'
+                            f'padding:5px 10px;margin:2px 0;font-size:.82em;color:#713f12;">'
+                            f'⚠️ 의안 조회 결과 없음 — {msg}</div>',
+                            unsafe_allow_html=True)
+                else:
+                    # 아직 조회 안 됨 (버튼 누를 때 spinner로 처리)
+                    st.caption("조회 중...")
 
             # 변경 히스토리
             if hist_n and hist_open:
