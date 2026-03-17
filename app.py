@@ -986,15 +986,19 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
             with cols[6]:
                 lbl = "🟢 O" if agenda_on else "—"
                 if st.button(lbl, key=f"agenda_{company}", use_container_width=True):
-                    agenda_status[company] = not agenda_on
-                    save_state(state); st.rerun()
+                    new_val = not agenda_on
+                    state["agenda_status"][company] = new_val
+                    st.session_state["state"]["agenda_status"][company] = new_val
+                    save_state(st.session_state["state"]); st.rerun()
 
             # 열8: 진행완료 여부
             with cols[7]:
                 lbl = "✅ O" if done_on else "—"
                 if st.button(lbl, key=f"done_{company}", use_container_width=True):
-                    done_status[company] = not done_on
-                    save_state(state); st.rerun()
+                    new_val = not done_on
+                    state["done_status"][company] = new_val
+                    st.session_state["state"]["done_status"][company] = new_val
+                    save_state(st.session_state["state"]); st.rerun()
 
             # 변경 히스토리
             if hist_n and hist_open:
@@ -1074,23 +1078,44 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                         st.rerun()
                 st.markdown("</div>", unsafe_allow_html=True)
 
+    # ── 진행완료 기업 분리 ──
+    done_set    = {c for c, v in done_status.items() if v}
+    df_done     = df[df["단체명"].isin(done_set)].reset_index(drop=True)
+    df_not_done = df[~df["단체명"].isin(done_set)].reset_index(drop=True)
+
+    df_conf_active = df_not_done[df_not_done["_conf"]].reset_index(drop=True)
+    df_pend_active = df_not_done[~df_not_done["_conf"]].reset_index(drop=True)
+
     # ── 확정 기업 표 ──
-    if not df_conf.empty:
+    if not df_conf_active.empty:
         st.markdown(
             f'<div style="background:#f0fdf4;border-left:4px solid #86efac;'
             f'padding:6px 14px;margin:8px 0 4px;font-weight:700;color:#166534;">'
-            f'📅 확정 기업 ({len(df_conf)}개)</div>', unsafe_allow_html=True)
+            f'📅 확정 기업 ({len(df_conf_active)}개)</div>', unsafe_allow_html=True)
         _render_header(prefix="conf")
-        _render_rows(df_conf)
+        _render_rows(df_conf_active)
 
     # ── 미정 기업 표 ──
-    if not df_pend.empty:
+    if not df_pend_active.empty:
         st.markdown(
             f'<div style="background:#fff7ed;border-left:4px solid #fdba74;'
             f'padding:6px 14px;margin:16px 0 4px;font-weight:700;color:#9a3412;">'
-            f'⏳ 미정 기업 ({len(df_pend)}개)</div>', unsafe_allow_html=True)
+            f'⏳ 미정 기업 ({len(df_pend_active)}개)</div>', unsafe_allow_html=True)
         _render_header(prefix="pend")
-        _render_rows(df_pend)
+        _render_rows(df_pend_active)
+
+    # ── 진행완료 기업 (접이식) ──
+    if not df_done.empty:
+        st.markdown("<br>", unsafe_allow_html=True)
+        with st.expander(f"✅ 진행완료 기업 ({len(df_done)}개) — 클릭하여 펼치기",
+                         expanded=False):
+            st.markdown(
+                '<div style="background:#f0fdf4;border-left:4px solid #4ade80;'
+                'padding:4px 14px;margin:0 0 6px;font-size:.85em;color:#166534;">'
+                '완료된 기업 목록입니다. ✅ 버튼을 다시 누르면 목록에서 제외됩니다.</div>',
+                unsafe_allow_html=True)
+            _render_header(prefix="done")
+            _render_rows(df_done)
 
 # ── 검색결과 탭 ───────────────────────────────
 
