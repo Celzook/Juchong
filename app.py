@@ -246,65 +246,78 @@ def _save_agenda_cache(cache: dict):
 
 def _parse_agendas(text: str) -> list:
     """
-    의결권대리행사권유참고서류/소집공고 텍스트에서 의안 목록 추출.
-    지원 형식: 한글제호(공백·탭·구분자 변형), 번호형, 한자형, 안건형, 의안형
+    의결권대리행사권유참고서류/소집공고에서 의안 계층 추출.
+    Returns: [{"no","title","type","is_sub","parent_no","candidate"}]
+      - N호  : 부모 의안
+      - N-M호: 자식 의안 (parent_no = N호)
     """
-    agendas = []
-    seen    = set()
-    SPECIAL_KW = ['정관','합병','분할','해산','자본감소','영업양도','이전']
+    items = []
+    seen  = set()
+    SPECIAL_KW = ['정관','합병','분할','해산','자본감소','영업양도']
+
+    def normalize(no_raw: str) -> str:
+        return f"제{no_raw.replace('－','-')}호"
+
+    def extract_candidate(title: str) -> str:
+        """제목에서 후보자 이름 추출 (한국인 이름 2~4자)"""
+        # "사내이사 홍길동 선임" 형태
+        m = re.search(r'(?:사내|사외|기타비상무|비상무)\s*이사\s+([가-힣]{2,4})\s+선임', title)
+        if m: return m.group(1)
+        # "- 홍길동 (" 형태
+        m = re.search(r'[-–]\s*([가-힣]{2,4})\s*[\(\s]', title)
+        if m: return m.group(1)
+        # "홍길동 선임의 건" — 이름이 제목 앞에
+        m = re.search(r'^([가-힣]{2,4})\s+선임', title)
+        if m: return m.group(1)
+        return ""
 
     def add(no_raw: str, title_raw: str):
-        no    = f"제{no_raw.replace('－','-')}호"
+        no    = normalize(no_raw)
         title = re.sub(r'\s+', ' ', title_raw).strip().strip(':：- ').strip()
         title = re.sub(r'\s*[\(\（](보통결의|특별결의)[\)\）]', '', title).strip()
-        if no not in seen and len(title) >= 4:
-            agendas.append({"no": no, "title": title})
-            seen.add(no)
+        if no in seen or len(title) < 4:
+            return
+        is_sub    = '-' in no_raw.replace('－','-')
+        parent_no = normalize(no_raw.split('-')[0]) if is_sub else None
+        candidate = extract_candidate(title)
+        items.append({
+            "no": no, "title": title, "type": "",
+            "is_sub": is_sub, "parent_no": parent_no,
+            "candidate": candidate,
+        })
+        seen.add(no)
 
-    # P1: 한글 "제N(-M)호 의안" — 공백·탭·콜론·대시 구분자 자유
-    for m in re.finditer(
-            r'제\s*(\d+(?:[-－]\d+)?)\s*호\s*의\s*안\s*[:\-：\t ]\s*([^\n\r]{2,80})',
-            text, re.MULTILINE):
-        add(m.group(1), m.group(2))
+    # P1: 한글 "제N(-M)호 의안" (공백·탭·콜론·대시 자유)
+    matches = list(re.finditer(
+        r'제\s*(\d+(?:[-－]\d+)?)\s*호\s*의\s*안\s*[:\-：\t ]\s*([^\n\r]{2,120})',
+        text, re.MULTILINE))
+    if not matches:
+        # P2: 한자 "第N號 議案"
+        matches = list(re.finditer(
+            r'第\s*(\d+)\s*號\s*議案\s*[:\-：\s]\s*([^\n\r]{2,80})', text, re.MULTILINE))
+    if not matches:
+        # P3: "N. XXX의 건" 번호형
+        matches = list(re.finditer(
+            r'^\s*(\d{1,2})\.\s+([가-힣][^\n\r]{2,70}(?:의\s*건|승인|선임|변경|개정|결정))',
+            text, re.MULTILINE))
+    if not matches:
+        # P4: "□ 안건N :" 형태
+        matches = list(re.finditer(
+            r'[□■◆]\s*안건\s*(\d+)\s*[:：]\s*([^\n\r]{4,80})', text, re.MULTILINE))
+    if not matches:
+        # P5: "의안 N." 형태
+        matches = list(re.finditer(
+            r'의안\s*(\d+)[.\s：:]\s*([^\n\r]{4,80})', text, re.MULTILINE))
+    if not matches:
+        # P6: "안건 제N호:" 형태
+        matches = list(re.finditer(
+            r'안건\s*제\s*(\d+)\s*호\s*[:：]\s*([^\n\r]{4,80})', text, re.MULTILINE))
 
-    # P2: 한자 "第N號 議案"
-    if not agendas:
-        for m in re.finditer(
-                r'第\s*(\d+)\s*號\s*議案\s*[:\-：\s]\s*([^\n\r]{2,80})',
-                text, re.MULTILINE):
-            add(m.group(1), m.group(2))
+    for m in matches:
+        add(m.group(1).replace('－','-'), m.group(2))
 
-    # P3: "N. XXX의 건/승인/선임/변경/개정/결정" 번호형
-    if not agendas:
-        for m in re.finditer(
-                r'^\s*(\d{1,2})\.\s+([가-힣][^\n\r]{2,70}'
-                r'(?:의\s*건|승인|선임|변경|개정|결정))',
-                text, re.MULTILINE):
-            add(m.group(1), m.group(2))
-
-    # P4: "□/■/◆ 안건N : 제목"
-    if not agendas:
-        for m in re.finditer(
-                r'[□■◆]\s*안건\s*(\d+)\s*[:：]\s*([^\n\r]{4,80})',
-                text, re.MULTILINE):
-            add(m.group(1), m.group(2))
-
-    # P5: "의안 N. / 의안N:" 형태
-    if not agendas:
-        for m in re.finditer(
-                r'의안\s*(\d+)[.\s：:]\s*([^\n\r]{4,80})',
-                text, re.MULTILINE):
-            add(m.group(1), m.group(2))
-
-    # P6: "안건 제N호: 제목" 형태
-    if not agendas:
-        for m in re.finditer(
-                r'안건\s*제\s*(\d+)\s*호\s*[:：]\s*([^\n\r]{4,80})',
-                text, re.MULTILINE):
-            add(m.group(1), m.group(2))
-
-    # ── 결의 종류 감지 ──
-    for item in agendas:
+    # ── 결의유형 감지 ──
+    for item in items:
         t       = item['title']
         pos     = text.find(item['no'])
         snippet = text[max(0, pos-50):pos+400] if pos >= 0 else ''
@@ -316,15 +329,49 @@ def _parse_agendas(text: str) -> list:
             item['type'] = '특별결의(추정)'
         else:
             item['type'] = '보통결의(추정)'
-        # 제목에서 결의유형 제거
         item['title'] = re.sub(
             r'\s*[\(\（](보통결의|특별결의)[추정()（）]*[\)\）]?', '', item['title']).strip()
 
-    return agendas
+    return items
+
+
+def _group_agendas(items: list) -> list:
+    """
+    items를 계층 구조로 정렬.
+    부모 N호 뒤에 자식 N-M호가 오도록 재배치.
+    부모 없는 N-M호(예: SK하이닉스)는 가상 그룹으로 묶음.
+    """
+    parents   = [it for it in items if not it['is_sub']]
+    subs      = [it for it in items if it['is_sub']]
+    parent_nos = {p['no'] for p in parents}
+    sub_map   = {}
+    for s in subs:
+        sub_map.setdefault(s['parent_no'], []).append(s)
+
+    result = []
+    for p in parents:
+        result.append(p)
+        result.extend(sub_map.get(p['no'], []))
+
+    # 부모 없는 서브의안 처리 (N-M호만 있는 경우)
+    for pno, children in sub_map.items():
+        if pno not in parent_nos:
+            # 가상 부모 삽입
+            virtual_title = children[0]['title'].split(' 선임')[0] + ' 선임의 건' \
+                if '선임' in children[0]['title'] else '이사 선임의 건'
+            result.append({
+                "no": pno, "title": virtual_title, "type": "보통결의(추정)",
+                "is_sub": False, "parent_no": None, "candidate": "", "virtual": True,
+            })
+            result.extend(children)
+
+    return result if result else items
+
 
 def fetch_dart_agendas(company_name: str, api_key: str) -> tuple[list, str]:
     """
-    의결권대리행사권유참고서류에서 의안 목록 조회.
+    의결권대리행사권유참고서류에서 의안 목록 조회 (계층 구조).
+    캐시 키: company_name + 연도 → 매년 자동 갱신.
     Returns (agendas: list[dict], message: str)
     """
     if not api_key:
@@ -332,12 +379,15 @@ def fetch_dart_agendas(company_name: str, api_key: str) -> tuple[list, str]:
     if not HAS_ODR:
         return [], "OpenDartReader 미설치"
 
-    # 캐시 확인
+    year      = datetime.now().year
+    cache_key = f"{company_name}_{year}"
+
+    # 파일 캐시 확인 (연도 포함 키)
     cache = _load_agenda_cache()
-    if company_name in cache:
-        cached = cache[company_name]
+    if cache_key in cache:
+        cached = cache[cache_key]
         if cached.get("agendas") is not None:
-            return cached["agendas"], f"캐시 ({cached.get('report_nm','')[:20]})"
+            return cached["agendas"], f"저장됨 ({cached.get('fetched_at','')[:10]})"
 
     try:
         corp_dict = load_corp_codes(api_key)
@@ -345,9 +395,7 @@ def fetch_dart_agendas(company_name: str, api_key: str) -> tuple[list, str]:
         if not corp_code:
             return [], "기업코드 미발견"
 
-        dart   = OpenDartReader(api_key)
-        year   = datetime.now().year
-        # 의결권대리행사권유참고서류는 주총 2~4주 전 공시 → 1월부터 조회
+        dart    = OpenDartReader(api_key)
         reports = dart.list(corp_code, start=f"{year}-01-01", end=f"{year}-03-31")
 
         if not isinstance(reports, pd.DataFrame) or reports.empty:
@@ -375,12 +423,14 @@ def fetch_dart_agendas(company_name: str, api_key: str) -> tuple[list, str]:
         soup     = BeautifulSoup(doc_html, "html.parser")
         text     = soup.get_text(separator="\n")
 
-        agendas = _parse_agendas(text)
+        raw     = _parse_agendas(text)
+        agendas = _group_agendas(raw)
 
-        # 캐시 저장
-        cache[company_name] = {
-            "agendas":   agendas,
-            "report_nm": report_nm,
+        # 파일 캐시 저장 (연도 포함 키)
+        cache[cache_key] = {
+            "agendas":    agendas,
+            "report_nm":  report_nm,
+            "year":       year,
             "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
         _save_agenda_cache(cache)
@@ -393,9 +443,6 @@ def fetch_dart_agendas(company_name: str, api_key: str) -> tuple[list, str]:
         return [], "네트워크 오류"
     except Exception as e:
         return [], f"오류: {str(e)[:60]}"
-
-
-# ── Claude AI 웹검색 ──────────────────────────
 
 def search_via_claude(company_name: str, anthropic_key: str):
     """
@@ -1073,12 +1120,13 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                             agenda_open_set.discard(company)
                         else:
                             agenda_open_set.add(company)
-                            # 아직 캐시 없으면 바로 조회
-                            mem_cache = st.session_state["agenda_cache_mem"]
-                            if company not in mem_cache:
+                            mem_cache  = st.session_state["agenda_cache_mem"]
+                            _year      = datetime.now().year
+                            _cache_key = f"{company}_{_year}"
+                            if _cache_key not in mem_cache:
                                 with st.spinner(f"{company} 의안 조회 중…"):
-                                    items, msg = fetch_dart_agendas(company, dart_key)
-                                mem_cache[company] = {"items": items, "msg": msg}
+                                    _items, _msg = fetch_dart_agendas(company, dart_key)
+                                mem_cache[_cache_key] = {"items": _items, "msg": _msg}
                                 st.session_state["agenda_cache_mem"] = mem_cache
                         st.rerun()
 
@@ -1191,78 +1239,85 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                     st.session_state["state"]["done_status"][company] = new_val
                     save_state(st.session_state["state"]); st.rerun()
 
-            # 의안 드롭다운
+            # 의안 드롭다운 (계층 구조 렌더링)
             if agenda_open_co:
+                _yr       = datetime.now().year
+                _ck       = f"{company}_{_yr}"
                 mem_cache = st.session_state.get("agenda_cache_mem", {})
-                if company in mem_cache:
-                    ag_data = mem_cache[company]
+
+                def _do_refresh():
+                    mem_cache.pop(_ck, None)
+                    disk = _load_agenda_cache()
+                    disk.pop(f"{company}_{_yr}", None)
+                    _save_agenda_cache(disk)
+                    st.session_state["agenda_cache_mem"] = mem_cache
+                    with st.spinner("재조회 중…"):
+                        ni, nm = fetch_dart_agendas(company, dart_key)
+                    mem_cache[_ck] = {"items": ni, "msg": nm}
+                    st.session_state["agenda_cache_mem"] = mem_cache
+                    st.rerun()
+
+                if _ck in mem_cache:
+                    ag_data = mem_cache[_ck]
                     items   = ag_data["items"]
                     msg     = ag_data["msg"]
+
                     if items:
-                        # 서브의안(N-M호)은 들여쓰기 처리
                         def _row_html(it):
-                            is_sub   = "-" in it["no"]
-                            indent   = "padding-left:22px;" if is_sub else ""
-                            no_color = "#6366f1" if not is_sub else "#818cf8"
-                            type_color = "#dc2626" if "특별" in it.get("type","") else "#16a34a"
+                            is_sub     = it.get("is_sub", False)
+                            is_virtual = it.get("virtual", False)
+                            indent_td  = "padding-left:20px;" if is_sub else ""
+                            prefix     = "└ " if is_sub else ""
+                            no_color   = "#818cf8" if is_sub else ("#94a3b8" if is_virtual else "#4338ca")
+                            no_weight  = "500" if is_sub else "700"
+                            tc         = "#dc2626" if "특별" in it.get("type","") else "#16a34a"
+                            cand       = it.get("candidate","")
+                            cand_html  = (f'<span style="color:#7c3aed;font-size:.75em;'
+                                         f'margin-left:6px">👤{cand}</span>') if cand else ""
+                            row_bg     = "#f5f3ff" if is_sub else ("" if not is_virtual else "#f8fafc")
                             return (
-                                f'<tr style="border-bottom:1px solid #e0e7ff">'
-                                f'<td style="padding:4px 8px;font-size:.8em;color:{no_color};'
-                                f'font-weight:700;white-space:nowrap;{indent}">{it["no"]}</td>'
-                                f'<td style="padding:4px 8px;font-size:.82em;color:#1f2937;{indent}">{it["title"]}</td>'
-                                f'<td style="padding:4px 8px;font-size:.75em;color:{type_color};white-space:nowrap">'
-                                f'{it.get("type","")}</td></tr>')
+                                f'<tr style="border-bottom:1px solid #e0e7ff;background:{row_bg}">'
+                                f'<td style="padding:3px 8px;font-size:.8em;color:{no_color};'
+                                f'font-weight:{no_weight};white-space:nowrap;{indent_td}">{prefix}{it["no"]}</td>'
+                                f'<td style="padding:3px 8px;font-size:.82em;color:#1f2937;{indent_td}">'
+                                f'{it["title"]}{cand_html}</td>'
+                                f'<td style="padding:3px 8px;font-size:.74em;color:{tc};white-space:nowrap">'
+                                f'{it.get("type","") if not is_sub else ""}</td></tr>')
 
                         rows_html = "".join(_row_html(it) for it in items)
-                        ag_c1, ag_c2 = st.columns([10, 1])
+                        ag_c1, ag_c2 = st.columns([11, 1])
                         with ag_c1:
                             st.markdown(
                                 f'<div style="background:#eef2ff;border-left:3px solid #818cf8;'
                                 f'padding:6px 10px;margin:2px 0;border-radius:4px;">'
                                 f'<div style="font-size:.78em;color:#4338ca;font-weight:700;margin-bottom:4px">'
-                                f'📋 의안 목록 ({len(items)}건)'
-                                f'<span style="font-weight:400;margin-left:8px;color:#6366f1">{msg}</span></div>'
+                                f'📋 의안 목록 ({len(items)}건) '
+                                f'<span style="font-weight:400;color:#6366f1">{msg}</span></div>'
                                 f'<table style="width:100%;border-collapse:collapse">'
                                 f'<tr style="background:#c7d2fe">'
-                                f'<th style="padding:3px 8px;font-size:.75em;text-align:left;width:80px">번호</th>'
-                                f'<th style="padding:3px 8px;font-size:.75em;text-align:left">의안명</th>'
-                                f'<th style="padding:3px 8px;font-size:.75em;text-align:left;width:90px">결의유형</th></tr>'
+                                f'<th style="padding:3px 8px;font-size:.74em;text-align:left;width:85px">번호</th>'
+                                f'<th style="padding:3px 8px;font-size:.74em;text-align:left">의안명 (👤후보자)</th>'
+                                f'<th style="padding:3px 8px;font-size:.74em;text-align:left;width:95px">결의유형</th></tr>'
                                 f'{rows_html}</table></div>',
                                 unsafe_allow_html=True)
                         with ag_c2:
-                            if st.button("🔄", key=f"ag_refresh_{company}",
-                                         help="의안 다시 조회"):
-                                mem_cache.pop(company, None)
-                                disk_cache = _load_agenda_cache()
-                                disk_cache.pop(company, None)
-                                _save_agenda_cache(disk_cache)
-                                st.session_state["agenda_cache_mem"] = mem_cache
-                                with st.spinner("재조회 중…"):
-                                    new_items, new_msg = fetch_dart_agendas(company, dart_key)
-                                mem_cache[company] = {"items": new_items, "msg": new_msg}
-                                st.session_state["agenda_cache_mem"] = mem_cache
-                                st.rerun()
+                            if st.button("🔄", key=f"ag_refresh_{company}", help="다시 조회"):
+                                _do_refresh()
                     else:
-                        rcol1, rcol2 = st.columns([10, 1])
-                        with rcol1:
+                        rc1, rc2 = st.columns([11, 1])
+                        with rc1:
                             st.markdown(
                                 f'<div style="background:#fef9c3;border-left:3px solid #fde047;'
                                 f'padding:5px 10px;margin:2px 0;font-size:.82em;color:#713f12;">'
                                 f'⚠️ 의안 파싱 실패 — {msg}'
                                 f'<br><span style="font-size:.9em;color:#92400e">'
-                                f'공시 형식이 지원되지 않거나 아직 공시되지 않았을 수 있습니다.</span></div>',
+                                f'공시 형식 미지원 또는 미공시 상태입니다.</span></div>',
                                 unsafe_allow_html=True)
-                        with rcol2:
+                        with rc2:
                             if st.button("🔄", key=f"ag_refresh_{company}", help="다시 조회"):
-                                mem_cache.pop(company, None)
-                                st.session_state["agenda_cache_mem"] = mem_cache
-                                with st.spinner("재조회 중…"):
-                                    ni, nm = fetch_dart_agendas(company, dart_key)
-                                mem_cache[company] = {"items": ni, "msg": nm}
-                                st.session_state["agenda_cache_mem"] = mem_cache
-                                st.rerun()
+                                _do_refresh()
                 else:
-                    st.caption("조회 중...")
+                    st.caption("의안 조회 중…")
 
             # 변경 히스토리
             if hist_n and hist_open:
