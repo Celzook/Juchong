@@ -8,6 +8,8 @@
   "agenda_status": {
     "현대모비스": true
   },
-  "done_status": {},
+  "done_status": {
+    "현대모비스": true
+  },
   "manager_overrides": {}
 }
