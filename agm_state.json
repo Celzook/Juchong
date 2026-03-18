@@ -19,7 +19,10 @@
     "기아": true,
     "삼성물산": true,
     "삼성바이오로직스": true,
-    "삼성중공업": true
+    "삼성중공업": true,
+    "풍산": true,
+    "효성": true,
+    "LG이노텍": true
   },
   "done_status": {
     "현대모비스": true
