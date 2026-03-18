@@ -50,6 +50,8 @@ table.cal td.today{background:#fffbe6;border:2px solid #f5c518;}
 .chip-updated{background:#fef9c3;color:#854d0e;border:1.5px solid #fde047;}
 .chip-pending{background:#fff7ed;color:#9a3412;border:1px dashed #fdba74;font-style:italic;}
 .chip-pending.req{background:#fef3c7;color:#92400e;border:1px dashed #fcd34d;}
+.chip-done{background:#fce7f3;color:#9d174d;border:1.5px solid #f9a8d4;}
+.chip-done.req{background:#fdf2f8;color:#831843;border:1.5px solid #f472b6;}
 .week-cnt{font-size:1.15em;} .week-sub{font-size:.68em;color:#64748b;margin-top:3px;}
 .date-conf{color:#166534;font-weight:600;} .date-pend{color:#9a3412;font-style:italic;}
 .src-ok{background:#dcfce7;color:#166534;font-size:.78em;padding:2px 8px;border-radius:8px;font-weight:600;}
@@ -542,9 +544,10 @@ def search_via_claude(company_name: str, anthropic_key: str):
 # ── 달력 ─────────────────────────────────────
 
 def build_day_map(df: pd.DataFrame, state: dict) -> dict:
-    day_map = {}
-    overrides = state["overrides"]
-    updated   = state.get("updated_recently", set())
+    day_map  = {}
+    overrides    = state["overrides"]
+    updated      = state.get("updated_recently", set())
+    done_status  = state.get("done_status", {})
     for _, row in df.iterrows():
         company = row["단체명"]
         disp    = overrides.get(company, row["주주총회일"])
@@ -552,10 +555,12 @@ def build_day_map(df: pd.DataFrame, state: dict) -> dict:
         key     = disp[:10] if conf else extract_pending_date(row["주주총회일"])
         if not key: continue
         day_map.setdefault(key, []).append({
-            "name": company, "confirmed": conf,
-            "required": row["비고"] == "필수단체",
-            "updated": company in updated,
-            "manager": row.get("운용사", ""),
+            "name":     company,
+            "confirmed": conf,
+            "required":  row["비고"] == "필수단체",
+            "updated":   company in updated,
+            "manager":   row.get("운용사", ""),
+            "done":      bool(done_status.get(company, False)),
         })
     return day_map
 
@@ -591,16 +596,24 @@ def render_calendar_html(year: int, month: int, day_map: dict) -> str:
             td_cls = "today" if key==today_str else ""
             cell = f'<td class="{td_cls}"><div class="cal-day-num">{d}{badge}</div>'
             for it in sorted(items, key=lambda x:(not x["confirmed"],not x["required"])):
-                if it["updated"]:                     cls = "chip chip-updated"
-                elif it["confirmed"] and it["required"]: cls = "chip chip-confirmed req"
-                elif it["confirmed"]:                 cls = "chip chip-confirmed"
-                elif it["required"]:                  cls = "chip chip-pending req"
-                else:                                 cls = "chip chip-pending"
+                if it.get("done"):
+                    cls = "chip chip-done req" if it["required"] else "chip chip-done"
+                elif it["updated"]:
+                    cls = "chip chip-updated"
+                elif it["confirmed"] and it["required"]:
+                    cls = "chip chip-confirmed req"
+                elif it["confirmed"]:
+                    cls = "chip chip-confirmed"
+                elif it["required"]:
+                    cls = "chip chip-pending req"
+                else:
+                    cls = "chip chip-pending"
                 pfx   = "★" if it["required"] else ""
                 sfx   = "" if it["confirmed"] else " *"
+                done_sfx = " ✓" if it.get("done") else ""
                 mgr   = it.get("manager","")
                 title = f' title="{mgr}"' if mgr else ""
-                cell += f'<span class="{cls}"{title}>{pfx}{it["name"]}{sfx}</span>'
+                cell += f'<span class="{cls}"{title}>{pfx}{it["name"]}{sfx}{done_sfx}</span>'
             cell += "</td>"
             html.append(cell)
         if wc+wp:
