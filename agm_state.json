@@ -38,7 +38,8 @@
   },
   "done_status": {
     "현대모비스": true,
-    "삼성전기": true
+    "삼성전기": true,
+    "삼성전자": true
   },
   "manager_overrides": {}
 }
