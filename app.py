@@ -20,9 +20,10 @@ except ImportError:
 st.set_page_config(page_title="주주총회 일정 트래커", page_icon="📅",
                    layout="wide", initial_sidebar_state="expanded")
 
-EXCEL_PATH = "주주총회.xlsx"
-STATE_PATH = "agm_state.json"
-CORP_CACHE = "dart_corp_codes.json"
+EXCEL_PATH      = "주주총회.xlsx"
+STATE_PATH      = "agm_state.json"
+CORP_CACHE      = "dart_corp_codes.json"
+GH_STATE_PATH   = "agm_state.json"   # GitHub 상에서의 state 파일 경로
 
 # ── CSS ──────────────────────────────────────
 st.markdown("""
@@ -748,10 +749,90 @@ def sync_to_github(state: dict, gh_token: str, repo_name: str, file_path: str = 
             else:
                 raise
 
-        return True, f"✅ GitHub 동기화 완료 ({updated_count}건 반영)"
+        # ── agm_state.json도 GitHub에 push ──
+        state_out = dict(state)
+        state_out["updated_recently"] = list(state.get("updated_recently", set()))
+        state_bytes = json.dumps(state_out, ensure_ascii=False, indent=2).encode("utf-8")
+        state_gh_path = GH_STATE_PATH
+
+        try:
+            existing_state = repo.get_contents(state_gh_path)
+            repo.update_file(
+                path    = state_gh_path,
+                message = f"상태 저장 ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
+                content = state_bytes,
+                sha     = existing_state.sha,
+            )
+        except GithubException as e2:
+            if e2.status == 404:
+                repo.create_file(
+                    path    = state_gh_path,
+                    message = f"상태 최초 저장 ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
+                    content = state_bytes,
+                )
+            else:
+                raise
+
+        return True, f"✅ GitHub 동기화 완료 (xlsx {updated_count}건 + 상태 저장)"
 
     except Exception as e:
         return False, f"❌ 오류: {str(e)[:120]}"
+
+def _pull_state_from_github(gh_token: str, repo_name: str) -> bool:
+    """
+    앱 시작 시 로컬 agm_state.json이 없으면 GitHub에서 pull.
+    Returns True if successfully restored.
+    """
+    if not HAS_GITHUB or not gh_token or not repo_name:
+        return False
+    if os.path.exists(STATE_PATH):
+        return False   # 로컬 파일 있으면 그냥 사용
+    try:
+        g    = Github(gh_token)
+        repo = g.get_repo(repo_name)
+        f    = repo.get_contents(GH_STATE_PATH)
+        raw  = f.decoded_content.decode("utf-8")
+        with open(STATE_PATH, "w", encoding="utf-8") as fp:
+            fp.write(raw)
+        return True
+    except Exception:
+        return False
+
+
+def _save_and_push_state(state: dict, gh_token: str = "", repo_name: str = ""):
+    """
+    로컬 저장 + (토큰 있으면) GitHub에 즉시 push.
+    save_state() 대신 이걸 쓰면 체크 즉시 GitHub에 반영.
+    """
+    # 로컬 저장
+    out = dict(state)
+    out["updated_recently"] = list(state.get("updated_recently", set()))
+    json.dump(out, open(STATE_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+    # GitHub push (토큰 있을 때만)
+    if HAS_GITHUB and gh_token and repo_name:
+        try:
+            g    = Github(gh_token)
+            repo = g.get_repo(repo_name)
+            content_bytes = json.dumps(out, ensure_ascii=False, indent=2).encode("utf-8")
+            try:
+                existing = repo.get_contents(GH_STATE_PATH)
+                repo.update_file(
+                    path    = GH_STATE_PATH,
+                    message = f"상태 자동저장 ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
+                    content = content_bytes,
+                    sha     = existing.sha,
+                )
+            except GithubException as e:
+                if e.status == 404:
+                    repo.create_file(
+                        path    = GH_STATE_PATH,
+                        message = "상태 최초 저장",
+                        content = content_bytes,
+                    )
+        except Exception:
+            pass   # push 실패해도 로컬은 저장됨
+
 
 def render_sidebar(state: dict):
     st.sidebar.title("⚙️ 설정")
@@ -887,25 +968,36 @@ def render_sidebar(state: dict):
     gh_token = st.sidebar.text_input(
         "GitHub Token (Fine-grained 권장)",
         type="password",
-        help="Fine-grained: Contents Read&Write 권한 필요"
+        help="Fine-grained: Contents Read&Write 권한 필요",
+        key="gh_token_input",
     )
     gh_repo = st.sidebar.text_input(
         "Repository (user/repo 형식)",
         placeholder="예: yourname/agm-tracker",
-        help="xlsx 파일이 있는 GitHub 레포지토리 경로"
+        help="xlsx 파일이 있는 GitHub 레포지토리 경로",
+        key="gh_repo_input",
     )
     gh_path = st.sidebar.text_input(
         "파일 경로 (repo 내 경로)",
         value="주주총회.xlsx",
-        help="repo 루트에 있으면 파일명만, 폴더 안이면 folder/파일명.xlsx"
+        help="repo 루트에 있으면 파일명만, 폴더 안이면 folder/파일명.xlsx",
+        key="gh_path_input",
     )
+    # 토큰·레포 session_state에 보관 (save/push 함수에서 참조)
+    if gh_token: st.session_state["_gh_token"] = gh_token
+    if gh_repo:  st.session_state["_gh_repo"]  = gh_repo
 
     if not HAS_GITHUB:
         st.sidebar.warning("PyGithub 미설치 — `pip install PyGithub`")
     elif gh_token and gh_repo:
         overrides_count = len(state.get("overrides", {}))
         st.sidebar.caption(f"적용된 날짜 override: {overrides_count}건")
-        if st.sidebar.button("🔄 GitHub에 xlsx 동기화", use_container_width=True, type="primary"):
+        done_count   = sum(1 for v in state.get("done_status",{}).values() if v)
+        agenda_count = sum(1 for v in state.get("agenda_status",{}).values() if v)
+        st.sidebar.caption(
+            f"날짜 override {len(state.get('overrides',{}))}건 │ "
+            f"의안분석 {agenda_count}건 │ 완료 {done_count}건 저장됨")
+        if st.sidebar.button("🔄 GitHub 동기화 (xlsx + 상태저장)", use_container_width=True, type="primary"):
             with st.spinner("GitHub에 업로드 중…"):
                 ok, msg = sync_to_github(state, gh_token, gh_repo, gh_path)
             if ok:
@@ -1270,7 +1362,12 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                     new_val = not agenda_on
                     state["agenda_status"][company] = new_val
                     st.session_state["state"]["agenda_status"][company] = new_val
-                    save_state(st.session_state["state"]); st.rerun()
+                    _save_and_push_state(
+                        st.session_state["state"],
+                        st.session_state.get("_gh_token",""),
+                        st.session_state.get("_gh_repo",""),
+                    )
+                    st.rerun()
 
             # 열8: 진행완료 여부
             with cols[7]:
@@ -1279,7 +1376,12 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                     new_val = not done_on
                     state["done_status"][company] = new_val
                     st.session_state["state"]["done_status"][company] = new_val
-                    save_state(st.session_state["state"]); st.rerun()
+                    _save_and_push_state(
+                        st.session_state["state"],
+                        st.session_state.get("_gh_token",""),
+                        st.session_state.get("_gh_repo",""),
+                    )
+                    st.rerun()
 
             # 의안 드롭다운 (계층 구조 렌더링)
             if agenda_open_co:
@@ -1547,8 +1649,29 @@ def render_results_tab(df: pd.DataFrame, state: dict):
 
 def main():
     init_session()
+
+    # ── 앱 재시작 시 GitHub에서 state 자동 복원 ──
+    if not os.path.exists(STATE_PATH):
+        _gh_tok  = st.session_state.get("_gh_token", "")
+        _gh_rep  = st.session_state.get("_gh_repo", "")
+        if _gh_tok and _gh_rep:
+            restored = _pull_state_from_github(_gh_tok, _gh_rep)
+            if restored:
+                # 복원된 state 재로드
+                st.session_state["state"] = load_state()
+
     state    = st.session_state["state"]
     dart_key, anthropic_key = render_sidebar(state)
+
+    # 사이드바 렌더 후 토큰이 입력되면 pull 재시도 (첫 번째 렌더 시 토큰 없을 수 있음)
+    if not os.path.exists(STATE_PATH):
+        _gh_tok = st.session_state.get("_gh_token", "")
+        _gh_rep = st.session_state.get("_gh_repo", "")
+        if _gh_tok and _gh_rep:
+            if _pull_state_from_github(_gh_tok, _gh_rep):
+                st.session_state["state"] = load_state()
+                state = st.session_state["state"]
+                st.rerun()
 
     st.title("📅 주주총회 일정 트래커")
     ts = max(state.get("updated_timestamps",{}).values(), default=None)
