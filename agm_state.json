@@ -6,7 +6,8 @@
   "updated_timestamps": {},
   "name_replacements": {},
   "agenda_status": {
-    "현대모비스": true
+    "현대모비스": true,
+    "삼성전기": true
   },
   "done_status": {
     "현대모비스": true
