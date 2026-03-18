@@ -37,7 +37,8 @@
     "하나금융지주": true
   },
   "done_status": {
-    "현대모비스": true
+    "현대모비스": true,
+    "삼성전기": true
   },
   "manager_overrides": {}
 }
