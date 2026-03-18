@@ -22,7 +22,9 @@
     "삼성중공업": true,
     "풍산": true,
     "효성": true,
-    "LG이노텍": true
+    "LG이노텍": true,
+    "NAVER": true,
+    "테스": true
   },
   "done_status": {
     "현대모비스": true
