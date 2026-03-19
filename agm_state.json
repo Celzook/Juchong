@@ -51,7 +51,9 @@
     "삼성바이오로직스": true,
     "삼성중공업": true,
     "풍산": true,
-    "효성": true
+    "효성": true,
+    "LG이노텍": true,
+    "NAVER": true
   },
   "manager_overrides": {},
   "withdrawn_set": [
