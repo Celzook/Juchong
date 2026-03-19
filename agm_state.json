@@ -34,7 +34,8 @@
     "셀트리온": true,
     "솔브레인": true,
     "신세계": true,
-    "하나금융지주": true
+    "하나금융지주": true,
+    "SK스퀘어": true
   },
   "done_status": {
     "현대모비스": true,
@@ -53,7 +54,9 @@
     "풍산": true,
     "효성": true,
     "LG이노텍": true,
-    "NAVER": true
+    "NAVER": true,
+    "테스": true,
+    "한솔제지": true
   },
   "manager_overrides": {},
   "withdrawn_set": [
