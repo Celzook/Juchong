@@ -59,6 +59,8 @@ table.cal td.today{background:#fffbe6;border:2px solid #f5c518;}
 .src-same{color:#6b7280;font-size:.78em;} .src-err{color:#dc2626;font-size:.78em;}
 .manual-box{background:#f0fdf4;border:1.5px solid #86efac;border-radius:8px;padding:14px 18px;margin:6px 0 10px;}
 .change-box{background:#fffbeb;border:1.5px solid #f59e0b;border-radius:8px;padding:14px 18px;margin:6px 0 10px;}
+.chip-withdrawn{background:#f3f4f6;color:#9ca3af;border:1px solid #d1d5db;text-decoration:line-through;}
+.chip-withdrawn.req{background:#e5e7eb;color:#6b7280;border:1px solid #9ca3af;text-decoration:line-through;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -94,7 +96,8 @@ def load_state() -> dict:
             pass
     return {"overrides":{}, "changes":{}, "change_history":{},
             "updated_recently":set(), "updated_timestamps":{},
-            "name_replacements":{}, "agenda_status":{}, "done_status":{}}
+            "name_replacements":{}, "agenda_status":{}, "done_status":{},
+            "withdrawn_set":[]}
 
 
 def save_state(state: dict):
@@ -545,10 +548,11 @@ def search_via_claude(company_name: str, anthropic_key: str):
 # ── 달력 ─────────────────────────────────────
 
 def build_day_map(df: pd.DataFrame, state: dict) -> dict:
-    day_map  = {}
+    day_map      = {}
     overrides    = state["overrides"]
     updated      = state.get("updated_recently", set())
     done_status  = state.get("done_status", {})
+    withdrawn    = set(state.get("withdrawn_set", []))
     for _, row in df.iterrows():
         company = row["단체명"]
         disp    = overrides.get(company, row["주주총회일"])
@@ -556,12 +560,13 @@ def build_day_map(df: pd.DataFrame, state: dict) -> dict:
         key     = disp[:10] if conf else extract_pending_date(row["주주총회일"])
         if not key: continue
         day_map.setdefault(key, []).append({
-            "name":     company,
+            "name":      company,
             "confirmed": conf,
             "required":  row["비고"] == "필수단체",
             "updated":   company in updated,
             "manager":   row.get("운용사", ""),
             "done":      bool(done_status.get(company, False)),
+            "withdrawn": company in withdrawn,
         })
     return day_map
 
@@ -576,12 +581,13 @@ def render_calendar_html(year: int, month: int, day_map: dict) -> str:
     for week in calendar.monthcalendar(year, month):
         wd = week[:5]
         if all(d==0 for d in wd): continue
-        wc = wp = 0
+        wc = wp = ww = 0
         for d in wd:
             if not d: continue
             for it in day_map.get(f"{year}-{month:02d}-{d:02d}", []):
-                if it["confirmed"]: wc+=1
-                else: wp+=1
+                if it.get("withdrawn"):  ww+=1
+                elif it["confirmed"]:    wc+=1
+                else:                    wp+=1
         html.append("<tr>")
         for d in wd:
             if not d:
@@ -596,8 +602,11 @@ def render_calendar_html(year: int, month: int, day_map: dict) -> str:
                 badge = f'<span class="{bc}">{total}</span>'
             td_cls = "today" if key==today_str else ""
             cell = f'<td class="{td_cls}"><div class="cal-day-num">{d}{badge}</div>'
-            for it in sorted(items, key=lambda x:(not x["confirmed"],not x["required"])):
-                if it.get("done"):
+            for it in sorted(items, key=lambda x:(
+                    x.get("withdrawn",False), not x["confirmed"], not x["required"])):
+                if it.get("withdrawn"):
+                    cls = "chip chip-withdrawn req" if it["required"] else "chip chip-withdrawn"
+                elif it.get("done"):
                     cls = "chip chip-done req" if it["required"] else "chip chip-done"
                 elif it["updated"]:
                     cls = "chip chip-updated"
@@ -609,17 +618,18 @@ def render_calendar_html(year: int, month: int, day_map: dict) -> str:
                     cls = "chip chip-pending req"
                 else:
                     cls = "chip chip-pending"
-                pfx   = "★" if it["required"] else ""
-                sfx   = "" if it["confirmed"] else " *"
+                pfx      = "★" if it["required"] else ""
+                sfx      = "" if it["confirmed"] else " *"
                 done_sfx = " ✓" if it.get("done") else ""
-                mgr   = it.get("manager","")
-                title = f' title="{mgr}"' if mgr else ""
-                cell += f'<span class="{cls}"{title}>{pfx}{it["name"]}{sfx}{done_sfx}</span>'
+                mgr      = it.get("manager","")
+                title    = f' title="{mgr}"' if mgr else ""
+                cell    += f'<span class="{cls}"{title}>{pfx}{it["name"]}{sfx}{done_sfx}</span>'
             cell += "</td>"
             html.append(cell)
-        if wc+wp:
+        if wc+wp+ww:
+            ww_str = f'<br><span style="color:#9ca3af">철회 {ww}</span>' if ww else ""
             html.append(f'<td class="week-total"><div class="week-cnt">🗓 {wc+wp}</div>'
-                        f'<div class="week-sub">확정 {wc}<br>미정 {wp}</div></td>')
+                        f'<div class="week-sub">확정 {wc}<br>미정 {wp}{ww_str}</div></td>')
         else:
             html.append('<td class="week-total"><span style="color:#ccc">—</span></td>')
         html.append("</tr>")
@@ -1092,6 +1102,7 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
     updated_recently = state.get("updated_recently", set())
     agenda_status    = state.setdefault("agenda_status", {})
     done_status      = state.setdefault("done_status", {})
+    withdrawn_set    = set(state.setdefault("withdrawn_set", []))
     pending          = st.session_state.setdefault("pending_updates", {})
     apply_sel        = st.session_state.setdefault("apply_selected", set())
 
@@ -1503,7 +1514,7 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
             # 기업변경 폼 (운용사 필드 포함)
             if st.session_state.get("inline_change") == company:
                 st.markdown('<div class="change-box">', unsafe_allow_html=True)
-                st.markdown(f"🔄 **{company}** → 다른 기업으로 교체")
+                st.markdown(f"🔄 **{company}** → 다른 기업으로 교체 또는 철회")
                 ic1, ic2, ic3 = st.columns([3, 2, 2])
                 with ic1:
                     new_name = st.text_input("새 기업명", key=f"ic_nm_{company}",
@@ -1520,7 +1531,7 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                     new_date = st.date_input("날짜", value=datetime(2026,3,25).date(),
                         min_value=date(2026,3,1), max_value=date(2026,3,31),
                         key=f"ic_dt_{company}").strftime("%Y-%m-%d")
-                bc1, bc2 = st.columns(2)
+                bc1, bc2, bc3 = st.columns(3)
                 with bc1:
                     if st.button("✅ 확정", type="primary",
                                  use_container_width=True, key=f"ic_ok_{company}"):
@@ -1528,23 +1539,42 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                         if nn:
                             _apply_company_change(state, company, nn, new_date, orig,
                                                   new_manager=new_manager_input.strip())
-                            save_state(state)
+                            _save_and_push_state(
+                                state,
+                                st.session_state.get("_gh_token",""),
+                                st.session_state.get("_gh_repo",""),
+                            )
                             load_excel_data.clear()
                             st.session_state["inline_change"] = None
                             st.rerun()
                         else:
                             st.error("기업명을 입력하세요.")
                 with bc2:
+                    if st.button("🚫 행사대상 철회", use_container_width=True,
+                                 key=f"ic_withdraw_{company}"):
+                        ws = state.setdefault("withdrawn_set", [])
+                        if company not in ws:
+                            ws.append(company)
+                        _save_and_push_state(
+                            state,
+                            st.session_state.get("_gh_token",""),
+                            st.session_state.get("_gh_repo",""),
+                        )
+                        st.session_state["inline_change"] = None
+                        st.rerun()
+                with bc3:
                     if st.button("❌ 취소", use_container_width=True,
                                  key=f"ic_cancel_{company}"):
                         st.session_state["inline_change"] = None
                         st.rerun()
                 st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── 진행완료 기업 분리 ──
+    # ── 진행완료 / 철회 기업 분리 ──
     done_set    = {c for c, v in done_status.items() if v}
-    df_done     = df[df["단체명"].isin(done_set)].reset_index(drop=True)
-    df_not_done = df[~df["단체명"].isin(done_set)].reset_index(drop=True)
+    df_withdrawn = df[df["단체명"].isin(withdrawn_set)].reset_index(drop=True)
+    df_active    = df[~df["단체명"].isin(withdrawn_set)].reset_index(drop=True)
+    df_done      = df_active[df_active["단체명"].isin(done_set)].reset_index(drop=True)
+    df_not_done  = df_active[~df_active["단체명"].isin(done_set)].reset_index(drop=True)
 
     df_conf_active = df_not_done[df_not_done["_conf"]].reset_index(drop=True)
     df_pend_active = df_not_done[~df_not_done["_conf"]].reset_index(drop=True)
@@ -1579,6 +1609,47 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                 unsafe_allow_html=True)
             _render_header(prefix="done")
             _render_rows(df_done)
+
+    # ── 행사대상 철회 기업 (접이식) ──
+    if not df_withdrawn.empty:
+        st.markdown("<br>", unsafe_allow_html=True)
+        with st.expander(
+                f"🚫 행사대상 철회 기업 ({len(df_withdrawn)}개) — 클릭하여 펼치기",
+                expanded=False):
+            st.markdown(
+                '<div style="background:#f3f4f6;border-left:4px solid #9ca3af;'
+                'padding:4px 14px;margin:0 0 6px;font-size:.85em;color:#6b7280;">'
+                '의결권 행사대상에서 철회된 기업입니다. 🔄 기업변경 버튼 → [철회 해제]로 복구할 수 있습니다.</div>',
+                unsafe_allow_html=True)
+            # 철회 기업 간단 테이블
+            for _, row in df_withdrawn.iterrows():
+                company_w = row["단체명"]
+                disp_w    = state["overrides"].get(company_w, row["주주총회일"])
+                manager_w = state.get("manager_overrides",{}).get(company_w, row.get("운용사",""))
+                wc1, wc2, wc3, wc4 = st.columns([4, 2, 2, 2])
+                with wc1:
+                    st.markdown(
+                        f'<span style="color:#9ca3af;font-size:.9em;text-decoration:line-through">'
+                        f'{company_w}</span>', unsafe_allow_html=True)
+                with wc2:
+                    st.markdown(f'<span style="color:#9ca3af;font-size:.85em">{disp_w}</span>',
+                                unsafe_allow_html=True)
+                with wc3:
+                    st.markdown(f'<span style="color:#9ca3af;font-size:.85em">{manager_w}</span>',
+                                unsafe_allow_html=True)
+                with wc4:
+                    if st.button("↩ 철회 해제", key=f"unwithdraw_{company_w}",
+                                 use_container_width=True):
+                        ws = state.get("withdrawn_set", [])
+                        if company_w in ws:
+                            ws.remove(company_w)
+                        state["withdrawn_set"] = ws
+                        _save_and_push_state(
+                            state,
+                            st.session_state.get("_gh_token",""),
+                            st.session_state.get("_gh_repo",""),
+                        )
+                        st.rerun()
 
 # ── 검색결과 탭 ───────────────────────────────
 
