@@ -110,7 +110,11 @@
     "한국전력공사": true,
     "HD건설기계": true,
     "HL만도": true,
-    "HL홀딩스": true
+    "HL홀딩스": true,
+    "JB금융지주": true,
+    "KB금융": true,
+    "KCC": true,
+    "KT&G": true
   },
   "manager_overrides": {},
   "withdrawn_set": [
