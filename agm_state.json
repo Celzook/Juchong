@@ -60,7 +60,11 @@
     "테스": true,
     "한솔제지": true,
     "CJ제일제당": true,
-    "LG생활건강": true
+    "LG생활건강": true,
+    "POSCO홀딩스": true,
+    "SK이노베이션": true,
+    "고려아연": true,
+    "셀트리온": false
   },
   "manager_overrides": {},
   "withdrawn_set": [
