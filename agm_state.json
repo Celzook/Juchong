@@ -123,7 +123,13 @@
     "SK텔레콤": true,
     "금호석유": true,
     "대한항공": true,
-    "메가스터디교육": true
+    "메가스터디교육": true,
+    "삼양식품": true,
+    "신한지주": true,
+    "아모레퍼시픽": true,
+    "아모레퍼시픽홀딩스": true,
+    "오리온": true,
+    "오리온홀딩스": true
   },
   "manager_overrides": {},
   "withdrawn_set": [
