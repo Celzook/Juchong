@@ -76,7 +76,10 @@
     "한국금융지주": true,
     "HD한국조선해양": true,
     "HD현대": true,
-    "HD현대중공업": true
+    "HD현대중공업": true,
+    "KT": true,
+    "LG화학": true,
+    "LIG넥스원": true
   },
   "done_status": {
     "현대모비스": true,
