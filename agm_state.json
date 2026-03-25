@@ -52,7 +52,11 @@
     "LX인터내셔널": true,
     "OCI홀딩스": true,
     "SKC": true,
-    "SK텔레콤": false
+    "SK텔레콤": false,
+    "금호석유": true,
+    "대한항공": true,
+    "메가스터디교육": true,
+    "삼양식품": true
   },
   "done_status": {
     "현대모비스": true,
