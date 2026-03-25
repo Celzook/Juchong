@@ -42,7 +42,11 @@
     "HD건설기계": true,
     "HK이노엔": true,
     "HL만도": true,
-    "HL홀딩스": true
+    "HL홀딩스": true,
+    "JB금융지주": true,
+    "KB금융": true,
+    "KCC": true,
+    "KT&G": true
   },
   "done_status": {
     "현대모비스": true,
