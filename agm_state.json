@@ -64,7 +64,8 @@
     "POSCO홀딩스": true,
     "SK이노베이션": true,
     "고려아연": true,
-    "셀트리온": false
+    "셀트리온": true,
+    "CJ": true
   },
   "manager_overrides": {},
   "withdrawn_set": [
