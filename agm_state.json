@@ -52,7 +52,7 @@
     "LX인터내셔널": true,
     "OCI홀딩스": true,
     "SKC": true,
-    "SK텔레콤": false,
+    "SK텔레콤": true,
     "금호석유": true,
     "대한항공": true,
     "메가스터디교육": true,
@@ -121,7 +121,9 @@
     "OCI홀딩스": true,
     "SKC": true,
     "SK텔레콤": true,
-    "금호석유": true
+    "금호석유": true,
+    "대한항공": true,
+    "메가스터디교육": true
   },
   "manager_overrides": {},
   "withdrawn_set": [
