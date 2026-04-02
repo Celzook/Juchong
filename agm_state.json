@@ -153,7 +153,19 @@
     "현대엘리베이터": true,
     "현대자동차": true,
     "현대제철": true,
-    "한국금융지주": true
+    "한국금융지주": true,
+    "HD한국조선해양": true,
+    "KT": true,
+    "LG화학": true,
+    "LIG넥스원": true,
+    "글로벌텍스프리": true,
+    "두산": true,
+    "에이플러스에셋": true,
+    "한미사이언스": true,
+    "HD현대": true,
+    "코웨이": true,
+    "HD현대중공업": true,
+    "두산에너빌리티": true
   },
   "manager_overrides": {},
   "withdrawn_set": [
