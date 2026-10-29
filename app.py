@@ -24,6 +24,12 @@ EXCEL_PATH      = "주주총회.xlsx"
 STATE_PATH      = "agm_state.json"
 CORP_CACHE      = "dart_corp_codes.json"
 GH_STATE_PATH   = "agm_state.json"   # GitHub 상에서의 state 파일 경로
+TARGET_MONTH    = 3                  # 정기주총 시즌 (3월)
+
+
+def target_year() -> int:
+    """대상 연도 — 사이드바에서 선택, 기본값은 올해"""
+    return int(st.session_state.get("target_year", date.today().year))
 
 # ── CSS ──────────────────────────────────────
 st.markdown("""
@@ -69,7 +75,7 @@ table.cal td.today{background:#fffbe6;border:2px solid #f5c518;}
 
 @st.cache_data
 def load_excel_data() -> pd.DataFrame:
-    df = pd.read_excel(EXCEL_PATH, sheet_name="리스트 대상 운용사", usecols="B:E", header=1)
+    df = pd.read_excel(EXCEL_PATH, sheet_name="리스트 대상 운용사", usecols="B:E", header=0)
     df.columns = ["단체명", "주주총회일", "비고", "운용사"]
     df = df.dropna(subset=["단체명"])
     df["단체명"]    = df["단체명"].astype(str).str.strip()
@@ -125,13 +131,21 @@ def init_session():
 
 # ── 날짜 유틸 ─────────────────────────────────
 
+def _month_first() -> date:
+    return date(target_year(), TARGET_MONTH, 1)
+
+def _month_last() -> date:
+    return date(target_year(), TARGET_MONTH,
+                calendar.monthrange(target_year(), TARGET_MONTH)[1])
+
 def is_confirmed(s) -> bool:
     return bool(re.match(r"\d{4}-\d{2}-\d{2}", str(s)))
 
-def validate_march_2026(d) -> bool:
-    return bool(d and re.match(r"2026-03-\d{2}$", str(d)))
+def validate_target_month(d) -> bool:
+    return bool(d and re.match(rf"{target_year()}-{TARGET_MONTH:02d}-\d{{2}}$", str(d)))
 
-def extract_pending_date(s: str, year: int = 2026):
+def extract_pending_date(s: str, year: int = None):
+    year = year or target_year()
     m = re.search(r"(\d{1,2})\.(\d{1,2})", str(s))
     return f"{year}-{int(m.group(1)):02d}-{int(m.group(2)):02d}" if m else None
 
@@ -167,19 +181,19 @@ def _parse_dart_date(text: str):
     m = re.search(r'일\s*시.*?(\d{4})[-년]\s*(\d{1,2})[-월]\s*(\d{1,2})[일]?', text, re.DOTALL)
     if m:
         d = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-        if validate_march_2026(d):
+        if validate_target_month(d):
             return d
     # 패턴 2: "2026년 3월 26일" 형태 전체 문서에서
-    m = re.search(r'(2026)[년\s.]*(\d{1,2})[월\s.]*(\d{1,2})[일]', text)
+    m = re.search(rf'({target_year()})[년\s.]*(\d{{1,2}})[월\s.]*(\d{{1,2}})[일]', text)
     if m:
         d = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-        if validate_march_2026(d):
+        if validate_target_month(d):
             return d
     # 패턴 3: 숫자 형식 2026-03-XX / 2026.03.XX
-    m = re.search(r'\b(2026)[.\-](0?[1-9]|1[0-2])[.\-](0?[1-9]|[12]\d|3[01])\b', text)
+    m = re.search(rf'\b({target_year()})[.\-](0?[1-9]|1[0-2])[.\-](0?[1-9]|[12]\d|3[01])\b', text)
     if m:
         d = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-        if validate_march_2026(d):
+        if validate_target_month(d):
             return d
     return None
 
@@ -198,7 +212,7 @@ def search_dart_api(company_name: str, api_key: str):
             return None, "기업코드 미발견"
 
         dart = OpenDartReader(api_key)
-        year = datetime.now().year
+        year = target_year()
         # kind 지정 없이 전체 공시 조회 — 주주총회소집결의는 A(정기) 아닌 경우도 있음
         reports = dart.list(corp_code, start=f"{year}-01-01", end=f"{year}-03-31")
 
@@ -385,7 +399,7 @@ def fetch_dart_agendas(company_name: str, api_key: str) -> tuple[list, str]:
     if not HAS_ODR:
         return [], "OpenDartReader 미설치"
 
-    year      = datetime.now().year
+    year      = target_year()
     cache_key = f"{company_name}_{year}"
 
     # 파일 캐시 확인 (연도 포함 키)
@@ -503,7 +517,7 @@ def search_via_claude(company_name: str, anthropic_key: str):
                 "messages": [{
                     "role": "user",
                     "content": (
-                        f"{company_name}의 2026년 정기주주총회 날짜를 검색해서 "
+                        f"{company_name}의 {target_year()}년 정기주주총회 날짜를 검색해서 "
                         f"YYYY-MM-DD 형식으로만 답해줘. "
                         f"날짜를 모르면 '모름'이라고만 해."
                     )
@@ -523,16 +537,16 @@ def search_via_claude(company_name: str, anthropic_key: str):
             b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"
         )
 
-        # 2026-03-XX 패턴 추출
-        m = re.search(r"2026-03-([0-2]\d|3[01])", full_text)
+        # YYYY-MM-XX 패턴 추출
+        m = re.search(rf"{target_year()}-{TARGET_MONTH:02d}-([0-2]\d|3[01])", full_text)
         if m:
             return m.group(0), "AI 웹검색"
 
         # "3월 XX일" 패턴도 처리
-        m2 = re.search(r"3월\s*([0-2]?\d|3[01])일", full_text)
+        m2 = re.search(rf"{TARGET_MONTH}월\s*([0-2]?\d|3[01])일", full_text)
         if m2:
-            d = f"2026-03-{int(m2.group(1)):02d}"
-            if validate_march_2026(d):
+            d = f"{target_year()}-{TARGET_MONTH:02d}-{int(m2.group(1)):02d}"
+            if validate_target_month(d):
                 return d, "AI 웹검색"
 
         if "모름" in full_text or not full_text.strip():
@@ -662,7 +676,7 @@ def _run_bulk_search(df, state, search_fn, label, delay=1.5):
         found, src = search_fn(corp)
         results[corp] = {"date": found, "source": src}
 
-        if validate_march_2026(found):
+        if validate_target_month(found):
             r_row = df[df["단체명"] == corp]
             cur = state["overrides"].get(
                 corp, r_row.iloc[0]["주주총회일"] if not r_row.empty else "")
@@ -709,10 +723,10 @@ def sync_to_github(state: dict, gh_token: str, repo_name: str, file_path: str = 
         overrides       = state.get("overrides", {})
         name_replacements = state.get("name_replacements", {})
 
-        # 헤더가 2행(header=1 → row index 2), 데이터는 3행부터
+        # 헤더가 1행, 데이터는 2행부터
         # 컬럼: B=단체명, C=주주총회일, D=비고
         updated_count = 0
-        for row in ws.iter_rows(min_row=3):
+        for row in ws.iter_rows(min_row=2):
             name_cell = row[1]   # col B (0-indexed: B=1)
             date_cell = row[2]   # col C
             if name_cell.value is None:
@@ -788,15 +802,14 @@ def sync_to_github(state: dict, gh_token: str, repo_name: str, file_path: str = 
     except Exception as e:
         return False, f"❌ 오류: {str(e)[:120]}"
 
-def _pull_state_from_github(gh_token: str, repo_name: str) -> bool:
+def _pull_state_from_github(gh_token: str, repo_name: str) -> tuple[bool, str | None]:
     """
-    앱 시작 시 로컬 agm_state.json이 없으면 GitHub에서 pull.
-    Returns True if successfully restored.
+    GitHub의 agm_state.json을 로컬로 pull (GitHub 상태가 원본).
+    세션당 1회, 토큰·레포 입력 직후 호출.
+    Returns (복원 여부, 오류 메시지|None). 원격 파일이 없으면(404) 오류 아님.
     """
     if not HAS_GITHUB or not gh_token or not repo_name:
-        return False
-    if os.path.exists(STATE_PATH):
-        return False   # 로컬 파일 있으면 그냥 사용
+        return False, None
     try:
         g    = Github(gh_token)
         repo = g.get_repo(repo_name)
@@ -804,23 +817,30 @@ def _pull_state_from_github(gh_token: str, repo_name: str) -> bool:
         raw  = f.decoded_content.decode("utf-8")
         with open(STATE_PATH, "w", encoding="utf-8") as fp:
             fp.write(raw)
-        return True
-    except Exception:
-        return False
+        return True, None
+    except GithubException as e:
+        if e.status == 404:
+            return False, None
+        return False, str(e)[:120]
+    except Exception as e:
+        return False, str(e)[:120]
 
 
 def _save_and_push_state(state: dict, gh_token: str = "", repo_name: str = ""):
     """
     로컬 저장 + (토큰 있으면) GitHub에 즉시 push.
-    save_state() 대신 이걸 쓰면 체크 즉시 GitHub에 반영.
+    상태 변경은 모두 이 함수로 저장한다 (save_state 직접 호출 금지).
     """
+    gh_token  = gh_token  or st.session_state.get("_gh_token", "")
+    repo_name = repo_name or st.session_state.get("_gh_repo", "")
+
     # 로컬 저장
+    save_state(state)
     out = dict(state)
     out["updated_recently"] = list(state.get("updated_recently", set()))
-    json.dump(out, open(STATE_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-    # GitHub push (토큰 있을 때만)
-    if HAS_GITHUB and gh_token and repo_name:
+    # GitHub push (토큰 있고, 이번 세션에 원격 상태를 정상 확인한 뒤에만 — 덮어쓰기 방지)
+    if HAS_GITHUB and gh_token and repo_name and st.session_state.get("_gh_pull_ok"):
         try:
             g    = Github(gh_token)
             repo = g.get_repo(repo_name)
@@ -840,12 +860,18 @@ def _save_and_push_state(state: dict, gh_token: str = "", repo_name: str = ""):
                         message = "상태 최초 저장",
                         content = content_bytes,
                     )
-        except Exception:
-            pass   # push 실패해도 로컬은 저장됨
+                else:
+                    raise
+            st.session_state.pop("_gh_push_error", None)
+        except Exception as e:
+            # push 실패해도 로컬은 저장됨 — 사이드바에 경고 표시
+            st.session_state["_gh_push_error"] = str(e)[:120]
 
 
 def render_sidebar(state: dict):
     st.sidebar.title("⚙️ 설정")
+    st.sidebar.number_input("대상 연도", min_value=2020, max_value=2100, step=1,
+                            value=date.today().year, key="target_year")
 
     # ── DART API 키 (무료) ──
     dart_key = st.sidebar.text_input(
@@ -937,7 +963,7 @@ def render_sidebar(state: dict):
                              use_container_width=True, type="primary"):
             for corp in to_apply:
                 new_d = pending[corp]["new_date"]
-                if validate_march_2026(new_d):
+                if validate_target_month(new_d):
                     state["overrides"][corp] = new_d
                     state.setdefault("updated_recently", set()).add(corp)
                     state.setdefault("updated_timestamps", {})[corp] = datetime.now().isoformat()
@@ -947,14 +973,14 @@ def render_sidebar(state: dict):
                 selected.discard(corp)
             st.session_state["pending_updates"] = pending
             st.session_state["apply_selected"]  = selected
-            save_state(state)
+            _save_and_push_state(state)
             st.sidebar.success(f"{len(to_apply)}개 적용 완료!")
             st.rerun()
     elif pending:
         st.sidebar.caption(f"⏳ 미적용 항목: {len(pending)}개 (리스트에서 체크하세요)")
 
     if st.sidebar.button("🗑️ 업데이트 표시 초기화", use_container_width=True):
-        state["updated_recently"] = set(); save_state(state); st.rerun()
+        state["updated_recently"] = set(); _save_and_push_state(state); st.rerun()
     if st.sidebar.button("⚠️ 전체 초기화", use_container_width=True, type="secondary"):
         for p in [STATE_PATH, CORP_CACHE]:
             if os.path.exists(p): os.remove(p)
@@ -997,6 +1023,9 @@ def render_sidebar(state: dict):
     if gh_token: st.session_state["_gh_token"] = gh_token
     if gh_repo:  st.session_state["_gh_repo"]  = gh_repo
 
+    if st.session_state.get("_gh_push_error"):
+        st.sidebar.warning(f"⚠️ GitHub 상태 저장 실패 (로컬엔 저장됨): "
+                           f"{st.session_state['_gh_push_error']}")
     if not HAS_GITHUB:
         st.sidebar.warning("PyGithub 미설치 — `pip install PyGithub`")
     elif gh_token and gh_repo:
@@ -1266,7 +1295,7 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                         else:
                             agenda_open_set.add(company)
                             mem_cache  = st.session_state["agenda_cache_mem"]
-                            _year      = datetime.now().year
+                            _year      = target_year()
                             _cache_key = f"{company}_{_year}"
                             if _cache_key not in mem_cache:
                                 with st.spinner(f"{company} 의안 조회 중…"):
@@ -1326,7 +1355,7 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                         cr = st.session_state.get("crawl_results", {})
                         cr[company] = {"date": found, "source": src}
                         st.session_state["crawl_results"] = cr
-                        if validate_march_2026(found) and found != disp:
+                        if validate_target_month(found) and found != disp:
                             pending[company] = {"new_date": found, "source": src, "prev_date": disp}
                             st.session_state["pending_updates"] = pending
                         st.rerun()
@@ -1339,10 +1368,10 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                     cr = st.session_state.get("crawl_results", {})
                     if company in cr:
                         fd = cr[company].get("date")
-                        if validate_march_2026(fd) and fd == disp:
+                        if validate_target_month(fd) and fd == disp:
                             st.markdown('<span class="src-same" style="font-size:.8em">✓ 동일</span>',
                                         unsafe_allow_html=True)
-                        elif not validate_march_2026(fd):
+                        elif not validate_target_month(fd):
                             st.markdown('<span class="src-err" style="font-size:.8em">✗</span>',
                                         unsafe_allow_html=True)
 
@@ -1396,7 +1425,7 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
 
             # 의안 드롭다운 (계층 구조 렌더링)
             if agenda_open_co:
-                _yr       = datetime.now().year
+                _yr       = target_year()
                 _ck       = f"{company}_{_yr}"
                 mem_cache = st.session_state.get("agenda_cache_mem", {})
 
@@ -1487,14 +1516,14 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
             if st.session_state.get("inline_manual") == company:
                 st.markdown('<div class="manual-box">', unsafe_allow_html=True)
                 st.markdown(f"📅 **{company}** 날짜 직접 입력")
-                default_date = datetime(2026, 3, 25).date()
+                default_date = date(target_year(), TARGET_MONTH, 25)
                 if is_confirmed(disp):
                     try: default_date = datetime.strptime(disp, "%Y-%m-%d").date()
                     except: pass
                 mc1, mc2 = st.columns([2, 3])
                 with mc1:
                     picked = st.date_input("날짜", value=default_date,
-                        min_value=date(2026,3,1), max_value=date(2026,3,31),
+                        min_value=_month_first(), max_value=_month_last(),
                         key=f"man_dt_{company}")
                 with mc2:
                     st.markdown("<br>", unsafe_allow_html=True)
@@ -1506,7 +1535,7 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                         state.setdefault("updated_timestamps", {})[company] = datetime.now().isoformat()
                         pending.pop(company, None); apply_sel.discard(company)
                         st.session_state["pending_updates"] = pending
-                        save_state(state)
+                        _save_and_push_state(state)
                         st.session_state["inline_manual"] = None
                         st.rerun()
                 st.markdown("</div>", unsafe_allow_html=True)
@@ -1528,8 +1557,8 @@ def render_list_view(df: pd.DataFrame, state: dict, dart_key: str, anthropic_key
                                    horizontal=True, key=f"ic_opt_{company}")
                 new_date = "미정"
                 if opt == "직접 입력":
-                    new_date = st.date_input("날짜", value=datetime(2026,3,25).date(),
-                        min_value=date(2026,3,1), max_value=date(2026,3,31),
+                    new_date = st.date_input("날짜", value=date(target_year(), TARGET_MONTH, 25),
+                        min_value=_month_first(), max_value=_month_last(),
                         key=f"ic_dt_{company}").strftime("%Y-%m-%d")
                 bc1, bc2, bc3 = st.columns(3)
                 with bc1:
@@ -1673,7 +1702,7 @@ def render_results_tab(df: pd.DataFrame, state: dict):
         src   = res.get("source", "미검색")
         if found is None: continue  # 검색 안 한 항목 제외
         status = ""
-        if validate_march_2026(found):
+        if validate_target_month(found):
             status = "✓ 동일" if found == cur else f"→ {found}"
         rows.append({
             "기업":   corp,
@@ -1707,12 +1736,12 @@ def render_results_tab(df: pd.DataFrame, state: dict):
         if st.button(f"✅ {len(applicable)}건 일괄 반영", type="primary", key="rt_apply"):
             for _, r in applicable.iterrows():
                 new_d = r["검색결과"]
-                if validate_march_2026(new_d):
+                if validate_target_month(new_d):
                     corp = r["기업"]
                     state["overrides"][corp] = new_d
                     state.setdefault("updated_recently",set()).add(corp)
                     state.setdefault("updated_timestamps",{})[corp] = datetime.now().isoformat()
-            save_state(state)
+            _save_and_push_state(state)
             st.success("반영 완료!"); st.rerun()
 
 
@@ -1721,27 +1750,27 @@ def render_results_tab(df: pd.DataFrame, state: dict):
 def main():
     init_session()
 
-    # ── 앱 재시작 시 GitHub에서 state 자동 복원 ──
-    if not os.path.exists(STATE_PATH):
-        _gh_tok  = st.session_state.get("_gh_token", "")
-        _gh_rep  = st.session_state.get("_gh_repo", "")
-        if _gh_tok and _gh_rep:
-            restored = _pull_state_from_github(_gh_tok, _gh_rep)
-            if restored:
-                # 복원된 state 재로드
-                st.session_state["state"] = load_state()
-
     state    = st.session_state["state"]
     dart_key, anthropic_key = render_sidebar(state)
 
-    # 사이드바 렌더 후 토큰이 입력되면 pull 재시도 (첫 번째 렌더 시 토큰 없을 수 있음)
-    if not os.path.exists(STATE_PATH):
-        _gh_tok = st.session_state.get("_gh_token", "")
-        _gh_rep = st.session_state.get("_gh_repo", "")
-        if _gh_tok and _gh_rep:
-            if _pull_state_from_github(_gh_tok, _gh_rep):
+    # ── 토큰·레포 입력 직후 세션당 1회 GitHub state 복원 (GitHub가 원본) ──
+    # 로컬 파일 유무와 무관하게 pull — 재시작 후 로컬만 있는 빈 상태가 GitHub를 덮어쓰지 않도록
+    _gh_tok = st.session_state.get("_gh_token", "")
+    _gh_rep = st.session_state.get("_gh_repo", "")
+    if _gh_tok and _gh_rep and st.session_state.get("_gh_pulled") != (_gh_tok, _gh_rep):
+        st.session_state["_gh_pulled"] = (_gh_tok, _gh_rep)
+        restored, err = _pull_state_from_github(_gh_tok, _gh_rep)
+        if err:
+            # 복원 실패 — push 차단, 다음 조작 시 재시도
+            st.session_state["_gh_pull_ok"] = False
+            st.session_state.pop("_gh_pulled", None)
+            st.session_state["_gh_push_error"] = f"원격 상태 복원 실패, 업로드 보류: {err}"
+            st.sidebar.warning(f"⚠️ {st.session_state['_gh_push_error']}")
+        else:
+            st.session_state["_gh_pull_ok"] = True
+            st.session_state.pop("_gh_push_error", None)
+            if restored:
                 st.session_state["state"] = load_state()
-                state = st.session_state["state"]
                 st.rerun()
 
     st.title("📅 주주총회 일정 트래커")
@@ -1774,8 +1803,8 @@ def main():
         m3.metric("⏳ 미정", len(df)-conf_n)
         m4.metric("🔴 필수단체", int((df["비고"]=="필수단체").sum()))
         st.markdown("---")
-        st.subheader("2026년 3월")
-        st.markdown(render_calendar_html(2026, 3, build_day_map(df, state)),
+        st.subheader(f"{target_year()}년 {TARGET_MONTH}월")
+        st.markdown(render_calendar_html(target_year(), TARGET_MONTH, build_day_map(df, state)),
                     unsafe_allow_html=True)
 
     with tab_list:
