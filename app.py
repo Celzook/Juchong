@@ -802,14 +802,14 @@ def sync_to_github(state: dict, gh_token: str, repo_name: str, file_path: str = 
     except Exception as e:
         return False, f"❌ 오류: {str(e)[:120]}"
 
-def _pull_state_from_github(gh_token: str, repo_name: str) -> bool:
+def _pull_state_from_github(gh_token: str, repo_name: str) -> tuple[bool, str | None]:
     """
     GitHub의 agm_state.json을 로컬로 pull (GitHub 상태가 원본).
     세션당 1회, 토큰·레포 입력 직후 호출.
-    Returns True if successfully restored.
+    Returns (복원 여부, 오류 메시지|None). 원격 파일이 없으면(404) 오류 아님.
     """
     if not HAS_GITHUB or not gh_token or not repo_name:
-        return False
+        return False, None
     try:
         g    = Github(gh_token)
         repo = g.get_repo(repo_name)
@@ -817,9 +817,13 @@ def _pull_state_from_github(gh_token: str, repo_name: str) -> bool:
         raw  = f.decoded_content.decode("utf-8")
         with open(STATE_PATH, "w", encoding="utf-8") as fp:
             fp.write(raw)
-        return True
-    except Exception:
-        return False
+        return True, None
+    except GithubException as e:
+        if e.status == 404:
+            return False, None
+        return False, str(e)[:120]
+    except Exception as e:
+        return False, str(e)[:120]
 
 
 def _save_and_push_state(state: dict, gh_token: str = "", repo_name: str = ""):
@@ -835,8 +839,8 @@ def _save_and_push_state(state: dict, gh_token: str = "", repo_name: str = ""):
     out = dict(state)
     out["updated_recently"] = list(state.get("updated_recently", set()))
 
-    # GitHub push (토큰 있을 때만)
-    if HAS_GITHUB and gh_token and repo_name:
+    # GitHub push (토큰 있고, 이번 세션에 원격 상태를 정상 확인한 뒤에만 — 덮어쓰기 방지)
+    if HAS_GITHUB and gh_token and repo_name and st.session_state.get("_gh_pull_ok"):
         try:
             g    = Github(gh_token)
             repo = g.get_repo(repo_name)
@@ -1755,9 +1759,19 @@ def main():
     _gh_rep = st.session_state.get("_gh_repo", "")
     if _gh_tok and _gh_rep and st.session_state.get("_gh_pulled") != (_gh_tok, _gh_rep):
         st.session_state["_gh_pulled"] = (_gh_tok, _gh_rep)
-        if _pull_state_from_github(_gh_tok, _gh_rep):
-            st.session_state["state"] = load_state()
-            st.rerun()
+        restored, err = _pull_state_from_github(_gh_tok, _gh_rep)
+        if err:
+            # 복원 실패 — push 차단, 다음 조작 시 재시도
+            st.session_state["_gh_pull_ok"] = False
+            st.session_state.pop("_gh_pulled", None)
+            st.session_state["_gh_push_error"] = f"원격 상태 복원 실패, 업로드 보류: {err}"
+            st.sidebar.warning(f"⚠️ {st.session_state['_gh_push_error']}")
+        else:
+            st.session_state["_gh_pull_ok"] = True
+            st.session_state.pop("_gh_push_error", None)
+            if restored:
+                st.session_state["state"] = load_state()
+                st.rerun()
 
     st.title("📅 주주총회 일정 트래커")
     ts = max(state.get("updated_timestamps",{}).values(), default=None)
